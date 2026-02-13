@@ -20,6 +20,10 @@ from typing import List
 from cflib import Crazyflie, LinkContext
 
 
+# Firmware buffer limit (must match MAX_MUSIC_EVENTS in jukebox.c)
+MAX_MUSIC_EVENTS = 5000
+
+
 # Match C firmware definitions
 class EventType(IntEnum):
     NOTE_ON = 0
@@ -227,6 +231,21 @@ def load_sequence_from_midi(midi_path: str, strategy_name: str, transformer_name
 
     sequence = converter.convert(strategy, transformer)
     print(f"\nGenerated {len(sequence)} MusicEvent objects")
+
+    # Check if sequence exceeds firmware buffer limit
+    if len(sequence) > MAX_MUSIC_EVENTS:
+        print(f"\n⚠️  WARNING: Sequence has {len(sequence)} events, but firmware buffer limit is {MAX_MUSIC_EVENTS}")
+        print(f"    Truncating to first {MAX_MUSIC_EVENTS} events...")
+
+        # Calculate approximate duration being truncated
+        if sequence:
+            total_duration_ms = sum(event.delta_ms for event in sequence)
+            truncated_duration_ms = sum(event.delta_ms for event in sequence[:MAX_MUSIC_EVENTS])
+            kept_percentage = (truncated_duration_ms / total_duration_ms * 100) if total_duration_ms > 0 else 0
+            print(f"    Keeping approximately {kept_percentage:.1f}% of the song ({truncated_duration_ms/1000:.1f}s / {total_duration_ms/1000:.1f}s)")
+
+        sequence = sequence[:MAX_MUSIC_EVENTS]
+        print(f"    Final sequence: {len(sequence)} events\n")
 
     return sequence
 
