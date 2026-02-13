@@ -3,16 +3,17 @@ MIDI utility functions for frequency conversion and range constants.
 """
 
 # Motor frequency range based on motors.h definitions
-# Tested range: C4 (262 Hz) to F6 (1396 Hz)
+# Tested range: C4 (262 Hz) to B7 (3951 Hz)
 MIN_MOTOR_FREQUENCY_HZ = 262   # C4
-MAX_MOTOR_FREQUENCY_HZ = 1396  # F6
+MAX_MOTOR_FREQUENCY_HZ = 3951  # B7
 
 # MIDI note numbers for reference
 # C4 = MIDI note 60 = 262 Hz
-# F6 = MIDI note 77 = 1396 Hz
-MIDI_NOTE_C4 = 60  # 262 Hz - minimum safe frequency
-MIDI_NOTE_F6 = 77  # 1396 Hz - maximum safe frequency
-MIDI_NOTE_A4 = 69  # Concert pitch: A4 = 440 Hz
+# B7 = MIDI note 107 = 3951 Hz
+MIDI_NOTE_C4 = 60   # 262 Hz - minimum safe frequency
+MIDI_NOTE_B7 = 107  # 3951 Hz - maximum safe frequency
+MIDI_NOTE_F6 = 77   # 1396 Hz - conservative maximum
+MIDI_NOTE_A4 = 69   # Concert pitch: A4 = 440 Hz
 
 
 def midi_note_to_frequency(note: int) -> int:
@@ -68,14 +69,14 @@ def frequency_to_midi_note(frequency: float) -> int:
     return int(round(note))
 
 
-def is_note_in_motor_range(note: int, min_note: int = MIDI_NOTE_C4, max_note: int = MIDI_NOTE_F6) -> bool:
+def is_note_in_motor_range(note: int, min_note: int = MIDI_NOTE_C4, max_note: int = MIDI_NOTE_B7) -> bool:
     """
     Check if a MIDI note falls within the motor's safe frequency range.
 
     Args:
         note: MIDI note number
         min_note: Minimum MIDI note (default: C4 = 262 Hz)
-        max_note: Maximum MIDI note (default: F6 = 1396 Hz)
+        max_note: Maximum MIDI note (default: B7 = 3951 Hz)
 
     Returns:
         True if note is within safe motor range

@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from typing import List
 
 from cflib import Crazyflie, LinkContext
+from midi_utils import MIN_MOTOR_FREQUENCY_HZ, MAX_MOTOR_FREQUENCY_HZ
 
 
 # Firmware buffer limit (must match MAX_MUSIC_EVENTS in jukebox.c)
@@ -53,16 +54,57 @@ class MusicEvent:
 
 # Note frequency definitions (matching motors.h)
 C4 = 262
+DES4 = 277
 D4 = 294
+ES4 = 311
 E4 = 330
 F4 = 349
+GES4 = 370
 G4 = 392
+AS4 = 415
 A4 = 440
-H4 = 493  # B4 in German notation
+B4 = 466
+H4 = 493
 C5 = 523
+DES5 = 554
 D5 = 587
+ES5 = 622
+E5 = 659
 F5 = 698
+GES5 = 740
 G5 = 783
+AS5 = 830
+A5 = 880
+B5 = 932
+H5 = 987
+C6 = 1046
+DES6 = 1108
+D6 = 1174
+ES6 = 1244
+E6 = 1318
+F6 = 1396
+GES6 = 1479
+G6 = 1567
+AS6 = 1661
+A6 = 1760
+B6 = 1864
+H6 = 1975
+C7 = 2093
+DES7 = 2217
+D7 = 2349
+ES7 = 2489
+E7 = 2637
+F7 = 2793
+GES7 = 2959
+G7 = 3135
+AS7 = 3322
+A7 = 3520
+H7 = 3729
+B7 = 3951
+
+# Motor frequency range limits are now defined in midi_utils.py
+# MIN_MOTOR_FREQUENCY_HZ = 262 (C4)
+# MAX_MOTOR_FREQUENCY_HZ = 3951 (B7)
 
 
 # Hardcoded test sequence matching the firmware
@@ -226,7 +268,9 @@ def load_sequence_from_midi(midi_path: str, strategy_name: str, transformer_name
     strategy = get_strategy(strategy_name)
     print(f"  Voice allocation: {strategy.get_description()}")
 
-    transformer = get_transformer(transformer_name)
+    # Get transformer with motor frequency range limits
+    transformer = get_transformer(transformer_name, min_hz=MIN_MOTOR_FREQUENCY_HZ, max_hz=MAX_MOTOR_FREQUENCY_HZ)
+
     print(f"  Frequency transform: {transformer.get_description()}")
 
     sequence = converter.convert(strategy, transformer)

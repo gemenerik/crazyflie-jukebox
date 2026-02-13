@@ -7,7 +7,12 @@ Crazyflie motor's frequency range by shifting octaves, clamping, or other strate
 
 from abc import ABC, abstractmethod
 from typing import Dict, Type
-from midi_utils import midi_note_to_frequency, MIDI_NOTE_C4, MIDI_NOTE_F6
+from midi_utils import (
+    midi_note_to_frequency,
+    frequency_to_midi_note,
+    MIN_MOTOR_FREQUENCY_HZ,
+    MAX_MOTOR_FREQUENCY_HZ,
+)
 
 
 class FrequencyTransformer(ABC):
@@ -41,21 +46,22 @@ class OctaveClippingTransformer(FrequencyTransformer):
     the octave, which generally sounds better than clamping.
 
     Example:
-        min_note=60 (C4), max_note=77 (F6)
-        Note 48 (C3) → shifted up to 60 (C4)
-        Note 89 (F7) → shifted down to 77 (F6)
+        min_hz=262 (C4), max_hz=3951 (B7)
+        Note 48 (C3, 130 Hz) → shifted up to 60 (C4, 262 Hz)
+        Note 120 (C10, 8372 Hz) → shifted down to 96 (C8, 4186 Hz)
     """
 
-    def __init__(self, min_note: int = MIDI_NOTE_C4, max_note: int = MIDI_NOTE_F6):
+    def __init__(self, min_hz: int = MIN_MOTOR_FREQUENCY_HZ, max_hz: int = MAX_MOTOR_FREQUENCY_HZ):
         """
         Initialize octave clipping transformer.
 
         Args:
-            min_note: Minimum MIDI note (default: 60 = C4, 262 Hz)
-            max_note: Maximum MIDI note (default: 77 = F6, 1396 Hz)
+            min_hz: Minimum frequency in Hz (default: 262 = C4)
+            max_hz: Maximum frequency in Hz (default: 3951 = B7)
         """
-        self.min_note = min_note
-        self.max_note = max_note
+        # Convert Hz to MIDI notes for internal use
+        self.min_note = frequency_to_midi_note(min_hz)
+        self.max_note = frequency_to_midi_note(max_hz)
 
     def transform(self, midi_note: int) -> int:
         """Shift note by octaves to fit range, then convert to Hz."""
@@ -103,18 +109,18 @@ class RangeClampingTransformer(FrequencyTransformer):
     motor capabilities.
 
     Example:
-        min_hz=130, max_hz=1047
-        Note generating 65 Hz → clamped to 130 Hz (sounds like different note)
-        Note generating 2093 Hz → clamped to 1047 Hz (sounds like different note)
+        min_hz=262, max_hz=3951
+        Note generating 130 Hz → clamped to 262 Hz (sounds like different note)
+        Note generating 8372 Hz → clamped to 3951 Hz (sounds like different note)
     """
 
-    def __init__(self, min_hz: int = 130, max_hz: int = 1047):
+    def __init__(self, min_hz: int = MIN_MOTOR_FREQUENCY_HZ, max_hz: int = MAX_MOTOR_FREQUENCY_HZ):
         """
         Initialize range clamping transformer.
 
         Args:
-            min_hz: Minimum frequency in Hz (default: 130 ≈ C3)
-            max_hz: Maximum frequency in Hz (default: 1047 ≈ C6)
+            min_hz: Minimum frequency in Hz (default: 262 = C4)
+            max_hz: Maximum frequency in Hz (default: 3951 = B7)
         """
         self.min_hz = min_hz
         self.max_hz = max_hz
@@ -136,12 +142,14 @@ TRANSFORMERS: Dict[str, Type[FrequencyTransformer]] = {
 }
 
 
-def get_transformer(name: str) -> FrequencyTransformer:
+def get_transformer(name: str, min_hz: int = MIN_MOTOR_FREQUENCY_HZ, max_hz: int = MAX_MOTOR_FREQUENCY_HZ) -> FrequencyTransformer:
     """
     Get a frequency transformer by name.
 
     Args:
         name: Transformer name ('octave-clip', 'none', 'clamp')
+        min_hz: Minimum frequency in Hz (default: 262 = C4)
+        max_hz: Maximum frequency in Hz (default: 3951 = B7)
 
     Returns:
         FrequencyTransformer instance
@@ -154,7 +162,13 @@ def get_transformer(name: str) -> FrequencyTransformer:
         raise ValueError(f"Unknown transformer '{name}'. Available: {available}")
 
     transformer_class = TRANSFORMERS[name]
-    return transformer_class()
+
+    # Pass min/max Hz to transformers that support it
+    if name in ('octave-clip', 'clamp'):
+        return transformer_class(min_hz=min_hz, max_hz=max_hz)
+    else:
+        # Passthrough and other transformers don't take parameters
+        return transformer_class()
 
 
 def list_transformers() -> None:
@@ -162,8 +176,9 @@ def list_transformers() -> None:
     print("\nAvailable Frequency Transformers:")
     print("=" * 70)
 
-    for name, transformer_class in TRANSFORMERS.items():
-        instance = transformer_class()
+    for name in TRANSFORMERS.keys():
+        # Use get_transformer to properly instantiate each transformer with defaults
+        instance = get_transformer(name)
         print(f"\n  {name}:")
         print(f"    {instance.get_description()}")
 
