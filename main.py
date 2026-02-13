@@ -195,9 +195,54 @@ async def stream_console(cf: Crazyflie) -> None:
         pass
 
 
+def load_sequence_from_midi(midi_path: str, strategy_name: str, transformer_name: str) -> List[MusicEvent]:
+    """
+    Load and convert MIDI file to MusicEvent sequence.
+
+    Args:
+        midi_path: Path to MIDI file
+        strategy_name: Voice allocation strategy name
+        transformer_name: Frequency transformer name
+
+    Returns:
+        List of MusicEvent objects
+    """
+    from midi_converter import MidiConverter
+    from voice_strategies import get_strategy
+    from frequency_transformers import get_transformer
+
+    print(f"\nLoading MIDI file: {midi_path}")
+    converter = MidiConverter()
+    converter.load_midi(midi_path)
+
+    # Print MIDI info
+    print(converter.get_info())
+
+    print(f"\nConverting with:")
+    strategy = get_strategy(strategy_name)
+    print(f"  Voice allocation: {strategy.get_description()}")
+
+    transformer = get_transformer(transformer_name)
+    print(f"  Frequency transform: {transformer.get_description()}")
+
+    sequence = converter.convert(strategy, transformer)
+    print(f"\nGenerated {len(sequence)} MusicEvent objects")
+
+    return sequence
+
+
 async def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Upload music to Crazyflie jukebox"
+        description="Upload music to Crazyflie jukebox",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  %(prog)s                                    # Use built-in test sequence
+  %(prog)s --midi song.mid                    # Convert and upload MIDI file
+  %(prog)s --midi song.mid --strategy melodic # Use specific strategy
+  %(prog)s --midi song.mid --transpose none   # No octave clipping
+  %(prog)s --list-strategies                  # Show available options
+        """
     )
     parser.add_argument(
         "uri",
@@ -205,9 +250,50 @@ async def main() -> None:
         default="radio://0/80/2M/E7E7E7E7E7",
         help="Crazyflie URI (default: radio://0/80/2M/E7E7E7E7E7)",
     )
+    parser.add_argument(
+        "--midi",
+        type=str,
+        help="Path to MIDI file to convert and upload",
+    )
+    parser.add_argument(
+        "--strategy",
+        type=str,
+        default="melodic",
+        help="Voice allocation strategy (default: melodic)",
+    )
+    parser.add_argument(
+        "--transpose",
+        type=str,
+        default="octave-clip",
+        help="Frequency transformation method (default: octave-clip)",
+    )
+    parser.add_argument(
+        "--list-strategies",
+        action="store_true",
+        help="List available strategies and transformers, then exit",
+    )
     args = parser.parse_args()
 
-    print(f"Connecting to {args.uri}...")
+    # Handle --list-strategies
+    if args.list_strategies:
+        from voice_strategies import list_strategies
+        from frequency_transformers import list_transformers
+        list_strategies()
+        list_transformers()
+        return
+
+    # Determine sequence source
+    if args.midi:
+        try:
+            sequence = load_sequence_from_midi(args.midi, args.strategy, args.transpose)
+        except Exception as e:
+            print(f"\nError loading MIDI file: {e}")
+            return
+    else:
+        sequence = TEST_SEQUENCE
+        print(f"\nUsing built-in test sequence ({len(sequence)} events)")
+
+    print(f"\nConnecting to {args.uri}...")
     context = LinkContext()
     cf = await Crazyflie.connect_from_uri(context, args.uri)
     print("Connected!")
@@ -231,8 +317,8 @@ async def main() -> None:
         # Wait a moment for console to show startup messages
         await asyncio.sleep(0.5)
 
-        # Upload and play the test sequence
-        await upload_sequence(app_channel, TEST_SEQUENCE)
+        # Upload and play the sequence
+        await upload_sequence(app_channel, sequence)
 
         # Wait for playback to complete
         print("\nWaiting for playback to complete...")

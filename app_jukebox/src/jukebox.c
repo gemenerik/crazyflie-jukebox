@@ -38,7 +38,7 @@
 #define DEBUG_MODULE "JUKEBOX"
 
 // Maximum number of music events we can store
-#define MAX_MUSIC_EVENTS 1000
+#define MAX_MUSIC_EVENTS 5000
 
 // Event types
 typedef enum {
