@@ -18,7 +18,15 @@ from dataclasses import dataclass
 from typing import List
 
 from cflib import Crazyflie, LinkContext
-from midi_utils import MIN_MOTOR_FREQUENCY_HZ, MAX_MOTOR_FREQUENCY_HZ
+from midi_utils import (
+    MIN_MOTOR_FREQUENCY_HZ,
+    MAX_MOTOR_FREQUENCY_HZ,
+    # Note frequencies
+    C4, DES4, D4, ES4, E4, F4, GES4, G4, AS4, A4, B4, H4,
+    C5, DES5, D5, ES5, E5, F5, GES5, G5, AS5, A5, B5, H5,
+    C6, DES6, D6, ES6, E6, F6, GES6, G6, AS6, A6, B6, H6,
+    C7, DES7, D7, ES7, E7, F7, GES7, G7, AS7, A7, H7, B7,
+)
 
 
 # Firmware buffer limit (must match MAX_MUSIC_EVENTS in jukebox.c)
@@ -50,61 +58,6 @@ class MusicEvent:
         # struct MusicEvent { uint16_t delta_ms; uint8_t motor; EventType event; uint16_t frequency; }
         # With __attribute__((packed)), this is 6 bytes: HH BB H = 2 + 1 + 1 + 2
         return struct.pack('<HBBH', self.delta_ms, self.motor, self.event, self.frequency)
-
-
-# Note frequency definitions (matching motors.h)
-C4 = 262
-DES4 = 277
-D4 = 294
-ES4 = 311
-E4 = 330
-F4 = 349
-GES4 = 370
-G4 = 392
-AS4 = 415
-A4 = 440
-B4 = 466
-H4 = 493
-C5 = 523
-DES5 = 554
-D5 = 587
-ES5 = 622
-E5 = 659
-F5 = 698
-GES5 = 740
-G5 = 783
-AS5 = 830
-A5 = 880
-B5 = 932
-H5 = 987
-C6 = 1046
-DES6 = 1108
-D6 = 1174
-ES6 = 1244
-E6 = 1318
-F6 = 1396
-GES6 = 1479
-G6 = 1567
-AS6 = 1661
-A6 = 1760
-B6 = 1864
-H6 = 1975
-C7 = 2093
-DES7 = 2217
-D7 = 2349
-ES7 = 2489
-E7 = 2637
-F7 = 2793
-GES7 = 2959
-G7 = 3135
-AS7 = 3322
-A7 = 3520
-H7 = 3729
-B7 = 3951
-
-# Motor frequency range limits are now defined in midi_utils.py
-# MIN_MOTOR_FREQUENCY_HZ = 262 (C4)
-# MAX_MOTOR_FREQUENCY_HZ = 3951 (B7)
 
 
 # Hardcoded test sequence matching the firmware
