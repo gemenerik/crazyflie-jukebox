@@ -1,0 +1,4 @@
+[submodule "crazyflie-firmware"]
+	path = crazyflie-firmware
+	url = https://github.com/bitcraze/crazyflie-firmware.git
+	branch = 2025.12.1
