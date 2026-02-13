@@ -247,7 +247,7 @@ def load_sequence_from_midi(midi_path: str, strategy_name: str, transformer_name
     return sequence
 
 
-async def main() -> None:
+async def main_async() -> None:
     parser = argparse.ArgumentParser(
         description="Upload music to Crazyflie jukebox",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -357,5 +357,12 @@ Examples:
         print("Disconnected!")
 
 
+def main() -> None:
+    try:
+        asyncio.run(main_async())
+    except KeyboardInterrupt:
+        pass  # Suppress traceback on Ctrl+C
+
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
