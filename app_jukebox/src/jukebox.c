@@ -31,8 +31,14 @@
 #include "debug.h"
 #include "motors.h"
 #include "system.h"
+#include "app_channel.h"
+#include "stabilizer.h"
+#include "watchdog.h"
 
 #define DEBUG_MODULE "JUKEBOX"
+
+// Maximum number of music events we can store
+#define MAX_MUSIC_EVENTS 1000
 
 // Event types
 typedef enum {
@@ -46,48 +52,33 @@ typedef struct {
   uint8_t motor;        // Motor ID (0-3 for M1-M4)
   EventType event;      // NOTE_ON or NOTE_OFF
   uint16_t frequency;   // Frequency in Hz (0 for NOTE_OFF)
-} MusicEvent;
+} __attribute__((packed)) MusicEvent;
 
-// Hardcoded test sequence: C major chord (C4-E4-G4-C5) held for 1s, then rest, then repeat
-static const MusicEvent testSequence[] = {
-  // Start C major chord - all motors start simultaneously
-  {0,    0, NOTE_ON,  C4},   // Motor 1: C4
-  {0,    1, NOTE_ON,  E4},   // Motor 2: E4
-  {0,    2, NOTE_ON,  G4},   // Motor 3: G4
-  {0,    3, NOTE_ON,  C5},   // Motor 4: C5
+// Appchannel packet types
+typedef enum {
+  PKT_START_UPLOAD,     // Start uploading a new sequence
+  PKT_EVENT_DATA,       // Music event data
+  PKT_END_UPLOAD,       // Finish upload and start playback
+} PacketType;
 
-  // Hold for 1000ms, then stop all
-  {1000, 0, NOTE_OFF, 0},
-  {0,    1, NOTE_OFF, 0},
-  {0,    2, NOTE_OFF, 0},
-  {0,    3, NOTE_OFF, 0},
+// Packet structures for appchannel communication
+typedef struct {
+  uint8_t type;         // PacketType
+  uint16_t total_events; // Total number of events that will be sent
+} __attribute__((packed)) StartUploadPacket;
 
-  // Rest for 500ms, then play F major chord (F4-A4-C5-F5)
-  {500,  0, NOTE_ON,  F4},
-  {0,    1, NOTE_ON,  A4},
-  {0,    2, NOTE_ON,  C5},
-  {0,    3, NOTE_ON,  F5},
+typedef struct {
+  uint8_t type;         // PacketType (PKT_EVENT_DATA)
+  MusicEvent event;     // The music event
+} __attribute__((packed)) EventDataPacket;
 
-  // Hold for 1000ms, then stop
-  {1000, 0, NOTE_OFF, 0},
-  {0,    1, NOTE_OFF, 0},
-  {0,    2, NOTE_OFF, 0},
-  {0,    3, NOTE_OFF, 0},
+typedef struct {
+  uint8_t type;         // PacketType (PKT_END_UPLOAD)
+} __attribute__((packed)) EndUploadPacket;
 
-  // Rest for 500ms, then play G major chord (G4-H4-D5-G5)
-  {500,  0, NOTE_ON,  G4},
-  {0,    1, NOTE_ON,  H4},   // H4 is B4 in German notation
-  {0,    2, NOTE_ON,  D5},
-  {0,    3, NOTE_ON,  G5},
-
-  // Hold for 1500ms, then stop
-  {1500, 0, NOTE_OFF, 0},
-  {0,    1, NOTE_OFF, 0},
-  {0,    2, NOTE_OFF, 0},
-  {0,    3, NOTE_OFF, 0},
-};
-
-#define SEQUENCE_LENGTH (sizeof(testSequence) / sizeof(MusicEvent))
+// Global buffer for uploaded music events
+static MusicEvent musicSequence[MAX_MUSIC_EVENTS];
+static size_t musicEventCount = 0;
 
 // Helper to start/stop a motor note immediately (non-blocking)
 void setMotorFrequency(uint8_t motorIndex, uint16_t frequency)
@@ -100,24 +91,35 @@ void setMotorFrequency(uint8_t motorIndex, uint16_t frequency)
     // Calculate the ratio for this frequency
     uint16_t ratio = (MOTORS_TIM_BEEP_CLK_FREQ / frequency) / 20;
     motorsBeep(motorId, true, frequency, ratio);
-    DEBUG_PRINT("Motor %u ON: %u Hz\n", motorIndex, frequency);
   } else {
     motorsBeep(motorId, false, 0, 0);
-    DEBUG_PRINT("Motor %u OFF\n", motorIndex);
   }
 }
 
 // Play the music sequence
 void playSequence(const MusicEvent* sequence, size_t length)
 {
-  DEBUG_PRINT("Playing sequence with %u events\n", length);
+  // Suspend both stabilizer and rate supervisor tasks to prevent interference
+  if (stabilizerTaskHandle != NULL) {
+    vTaskSuspend(stabilizerTaskHandle);
+  }
+
+  if (rateSupervisorTaskHandle != NULL) {
+    vTaskSuspend(rateSupervisorTaskHandle);
+  }
 
   for (size_t i = 0; i < length; i++) {
     const MusicEvent* event = &sequence[i];
 
-    // Wait for delta time
+    // Wait for delta time, feeding watchdog periodically
     if (event->delta_ms > 0) {
-      vTaskDelay(M2T(event->delta_ms));
+      uint32_t remainingMs = event->delta_ms;
+      while (remainingMs > 0) {
+        uint32_t delayMs = (remainingMs > 50) ? 50 : remainingMs;
+        vTaskDelay(M2T(delayMs));
+        remainingMs -= delayMs;
+        watchdogReset();  // Feed watchdog every 50ms (timeout is 100-353ms)
+      }
     }
 
     // Process event
@@ -126,28 +128,112 @@ void playSequence(const MusicEvent* sequence, size_t length)
     } else {
       setMotorFrequency(event->motor, 0);
     }
+
+    watchdogReset();
   }
 
-  DEBUG_PRINT("Sequence finished\n");
+  // Feed watchdog before resuming tasks
+  watchdogReset();
+
+  // Resume stabilizer first, then rate supervisor (reverse order of suspension)
+  if (stabilizerTaskHandle != NULL) {
+    vTaskResume(stabilizerTaskHandle);
+  }
+
+  // Small delay to let stabilizer task run before rate supervisor checks it
+  vTaskDelay(M2T(10));
+  watchdogReset();
+
+  if (rateSupervisorTaskHandle != NULL) {
+    vTaskResume(rateSupervisorTaskHandle);
+  }
+}
+
+// Handle incoming appchannel packets to upload music sequence
+void receiveAndPlayMusic()
+{
+  uint8_t buffer[APPCHANNEL_MTU];
+
+  DEBUG_PRINT("Waiting for music upload via appchannel...\n");
+
+  while (1) {
+    // Wait for START_UPLOAD packet
+    size_t len = appchannelReceiveDataPacket(buffer, sizeof(buffer), APPCHANNEL_WAIT_FOREVER);
+
+    if (len == 0) {
+      DEBUG_PRINT("ERROR: No data received\n");
+      continue;
+    }
+
+    StartUploadPacket* startPkt = (StartUploadPacket*)buffer;
+    if (startPkt->type != PKT_START_UPLOAD) {
+      DEBUG_PRINT("WARNING: Expected START_UPLOAD, got type %d. Ignoring.\n", startPkt->type);
+      continue;
+    }
+
+    DEBUG_PRINT("Starting upload: expecting %u events\n", startPkt->total_events);
+
+    // Reset buffer
+    musicEventCount = 0;
+
+    // Receive events
+    while (musicEventCount < MAX_MUSIC_EVENTS) {
+      len = appchannelReceiveDataPacket(buffer, sizeof(buffer), APPCHANNEL_WAIT_FOREVER);
+
+      if (len == 0) {
+        DEBUG_PRINT("ERROR: No data received\n");
+        break;
+      }
+
+      uint8_t pktType = buffer[0];
+
+      if (pktType == PKT_EVENT_DATA) {
+        EventDataPacket* eventPkt = (EventDataPacket*)buffer;
+        musicSequence[musicEventCount] = eventPkt->event;
+        musicEventCount++;
+
+        if (musicEventCount % 50 == 0) {
+          DEBUG_PRINT("Received %u events...\n", musicEventCount);
+        }
+      }
+      else if (pktType == PKT_END_UPLOAD) {
+        DEBUG_PRINT("Upload complete: %u events received\n", musicEventCount);
+
+        // Play the uploaded sequence
+        if (musicEventCount > 0) {
+          playSequence(musicSequence, musicEventCount);
+          DEBUG_PRINT("Playback finished!\n");
+        } else {
+          DEBUG_PRINT("WARNING: No events to play\n");
+        }
+
+        break;
+      }
+      else {
+        DEBUG_PRINT("ERROR: Unknown packet type %d\n", pktType);
+        break;
+      }
+    }
+
+    if (musicEventCount >= MAX_MUSIC_EVENTS) {
+      DEBUG_PRINT("WARNING: Event buffer full at %u events\n", musicEventCount);
+    }
+
+    // Ready for next upload
+    DEBUG_PRINT("\nReady for next song upload.\n");
+  }
 }
 
 void appMain()
 {
   DEBUG_PRINT("Jukebox app started!\n");
+  DEBUG_PRINT("sizeof(MusicEvent) = %u\n", sizeof(MusicEvent));
+  DEBUG_PRINT("sizeof(EventDataPacket) = %u\n", sizeof(EventDataPacket));
 
   // Wait for system to be fully initialized (motors, sensors, etc.)
   systemWaitStart();
   DEBUG_PRINT("System ready!\n");
 
-  DEBUG_PRINT("Playing polyphonic test sequence...\n");
-
-  // Play the hardcoded sequence
-  playSequence(testSequence, SEQUENCE_LENGTH);
-
-  DEBUG_PRINT("Playback finished!\n");
-
-  // Keep app running
-  while(1) {
-    vTaskDelay(M2T(1000));
-  }
+  // Main loop: receive and play music sequences from appchannel
+  receiveAndPlayMusic();
 }
