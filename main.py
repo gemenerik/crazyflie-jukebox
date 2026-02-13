@@ -339,18 +339,20 @@ Examples:
         # Upload and play the sequence
         await upload_sequence(app_channel, sequence)
 
-        # Wait for playback to complete
-        print("\nWaiting for playback to complete...")
-        await asyncio.sleep(15.0)
-
+        # Stay connected until user interrupts
         print("\n" + "=" * 60)
-        print("Done!")
+        print("Connected! Press Ctrl+C to disconnect.")
+        print("=" * 60)
+
+        # Wait indefinitely until Ctrl+C
+        while True:
+            await asyncio.sleep(1)
 
     except KeyboardInterrupt:
-        print("\nInterrupted by user")
+        print("\n\nInterrupted by user")
     finally:
         console_task.cancel()
-        print("\nDisconnecting...")
+        print("Disconnecting...")
         await cf.disconnect()
         print("Disconnected!")
 
