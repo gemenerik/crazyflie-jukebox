@@ -217,6 +217,47 @@ def load_sequence_from_midi(midi_path: str, strategy_name: str, transformer_name
     # Print MIDI info
     print(converter.get_info())
 
+    # Show track information and ask user which tracks to use
+    print(converter.get_track_info())
+
+    selected_tracks = None
+    tracks_with_notes = [t['index'] for t in converter.track_info if t['note_count'] > 0]
+
+    if len(tracks_with_notes) > 1:
+        print(f"\nThis MIDI file has {len(tracks_with_notes)} tracks with notes.")
+        print("You can use all tracks (they'll be mixed together),")
+        print("or select specific tracks to reduce complexity.")
+
+        while True:
+            user_input = input("\nEnter track numbers (e.g., '1 3 5') or press Enter for all tracks: ").strip()
+
+            if not user_input:
+                # User pressed Enter - use all tracks
+                print("Using all tracks")
+                selected_tracks = None
+                break
+
+            try:
+                # Parse space-separated track numbers
+                selected_tracks = [int(x.strip()) for x in user_input.split()]
+
+                # Validate track numbers
+                invalid_tracks = [t for t in selected_tracks if t not in tracks_with_notes]
+                if invalid_tracks:
+                    print(f"❌ Invalid track numbers: {invalid_tracks}")
+                    print(f"   Valid tracks with notes: {tracks_with_notes}")
+                    continue
+
+                print(f"Using tracks: {selected_tracks}")
+                break
+
+            except ValueError:
+                print("❌ Invalid input. Please enter track numbers separated by spaces (e.g., '1 3 5')")
+                continue
+    else:
+        print(f"\nOnly one track with notes found, using it automatically.")
+        selected_tracks = None
+
     print(f"\nConverting with:")
     strategy = get_strategy(strategy_name)
     print(f"  Voice allocation: {strategy.get_description()}")
@@ -226,7 +267,7 @@ def load_sequence_from_midi(midi_path: str, strategy_name: str, transformer_name
 
     print(f"  Frequency transform: {transformer.get_description()}")
 
-    sequence = converter.convert(strategy, transformer)
+    sequence = converter.convert(strategy, transformer, selected_tracks)
     print(f"\nGenerated {len(sequence)} MusicEvent objects")
 
     # Check if sequence exceeds firmware buffer limit

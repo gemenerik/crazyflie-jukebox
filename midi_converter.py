@@ -6,7 +6,7 @@ Handles tempo changes, multi-track files, and voice allocation for 4-motor polyp
 """
 
 import os
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Optional
 from dataclasses import dataclass
 import mido
 
@@ -51,6 +51,7 @@ class MidiConverter:
         self.tempo_map: List[Tuple[int, int]] = []  # [(tick, microseconds_per_beat), ...]
         self.ticks_per_beat: int = 0
         self.timeline: List[MidiNote] = []
+        self.track_info: List[Dict] = []  # Track metadata for user selection
 
     def load_midi(self, filename: str) -> None:
         """
@@ -86,7 +87,10 @@ class MidiConverter:
         self.ticks_per_beat = self.midi_file.ticks_per_beat
         self.tempo_map = self._build_tempo_map()
 
-        # Build timeline of all note events
+        # Analyze tracks for user selection
+        self.track_info = self._analyze_tracks()
+
+        # Build timeline of all note events (will be rebuilt during convert if tracks selected)
         self.timeline = self._build_timeline()
 
         if len(self.timeline) == 0:
@@ -169,12 +173,126 @@ class MidiConverter:
 
         return int(round(current_time_ms))
 
-    def _build_timeline(self) -> List[MidiNote]:
+    def _analyze_tracks(self) -> List[Dict]:
         """
-        Build absolute timeline of all note events from all tracks.
+        Analyze each track to help users select which ones to use.
 
-        Merges all tracks into a single sorted timeline, converting
+        Returns:
+            List of dicts with track metadata: {
+                'index': int,
+                'name': str,
+                'instrument': str,
+                'note_count': int,
+                'note_range': tuple(min, max),
+                'channels': set
+            }
+        """
+        track_info = []
+
+        for track_idx, track in enumerate(self.midi_file.tracks):
+            info = {
+                'index': track_idx,
+                'name': f'Track {track_idx}',
+                'instrument': None,
+                'note_count': 0,
+                'note_range': (127, 0),  # (min, max)
+                'channels': set()
+            }
+
+            notes = []
+            for msg in track:
+                # Extract track name
+                if msg.type == 'track_name':
+                    info['name'] = msg.name
+
+                # Extract program change (instrument)
+                if msg.type == 'program_change':
+                    # MIDI General MIDI instrument names
+                    info['instrument'] = self._get_instrument_name(msg.program)
+
+                # Count notes
+                if msg.type in ('note_on', 'note_off'):
+                    if hasattr(msg, 'channel'):
+                        info['channels'].add(msg.channel)
+
+                if msg.type == 'note_on' and msg.velocity > 0:
+                    info['note_count'] += 1
+                    notes.append(msg.note)
+
+            # Calculate note range
+            if notes:
+                info['note_range'] = (min(notes), max(notes))
+
+            track_info.append(info)
+
+        return track_info
+
+    def _get_instrument_name(self, program: int) -> str:
+        """Get General MIDI instrument name from program number."""
+        # Simplified GM instrument names (0-127)
+        instruments = [
+            # Piano (0-7)
+            "Acoustic Grand Piano", "Bright Acoustic Piano", "Electric Grand Piano",
+            "Honky-tonk Piano", "Electric Piano 1", "Electric Piano 2", "Harpsichord", "Clavi",
+            # Chromatic Percussion (8-15)
+            "Celesta", "Glockenspiel", "Music Box", "Vibraphone", "Marimba", "Xylophone",
+            "Tubular Bells", "Dulcimer",
+            # Organ (16-23)
+            "Drawbar Organ", "Percussive Organ", "Rock Organ", "Church Organ", "Reed Organ",
+            "Accordion", "Harmonica", "Tango Accordion",
+            # Guitar (24-31)
+            "Acoustic Guitar (nylon)", "Acoustic Guitar (steel)", "Electric Guitar (jazz)",
+            "Electric Guitar (clean)", "Electric Guitar (muted)", "Overdriven Guitar",
+            "Distortion Guitar", "Guitar harmonics",
+            # Bass (32-39)
+            "Acoustic Bass", "Electric Bass (finger)", "Electric Bass (pick)", "Fretless Bass",
+            "Slap Bass 1", "Slap Bass 2", "Synth Bass 1", "Synth Bass 2",
+            # Strings (40-47)
+            "Violin", "Viola", "Cello", "Contrabass", "Tremolo Strings", "Pizzicato Strings",
+            "Orchestral Harp", "Timpani",
+            # Ensemble (48-55)
+            "String Ensemble 1", "String Ensemble 2", "Synth Strings 1", "Synth Strings 2",
+            "Choir Aahs", "Voice Oohs", "Synth Voice", "Orchestra Hit",
+            # Brass (56-63)
+            "Trumpet", "Trombone", "Tuba", "Muted Trumpet", "French Horn", "Brass Section",
+            "Synth Brass 1", "Synth Brass 2",
+            # Reed (64-71)
+            "Soprano Sax", "Alto Sax", "Tenor Sax", "Baritone Sax", "Oboe", "English Horn",
+            "Bassoon", "Clarinet",
+            # Pipe (72-79)
+            "Piccolo", "Flute", "Recorder", "Pan Flute", "Blown Bottle", "Shakuhachi",
+            "Whistle", "Ocarina",
+            # Synth Lead (80-87)
+            "Lead 1 (square)", "Lead 2 (sawtooth)", "Lead 3 (calliope)", "Lead 4 (chiff)",
+            "Lead 5 (charang)", "Lead 6 (voice)", "Lead 7 (fifths)", "Lead 8 (bass + lead)",
+            # Synth Pad (88-95)
+            "Pad 1 (new age)", "Pad 2 (warm)", "Pad 3 (polysynth)", "Pad 4 (choir)",
+            "Pad 5 (bowed)", "Pad 6 (metallic)", "Pad 7 (halo)", "Pad 8 (sweep)",
+            # Synth Effects (96-103)
+            "FX 1 (rain)", "FX 2 (soundtrack)", "FX 3 (crystal)", "FX 4 (atmosphere)",
+            "FX 5 (brightness)", "FX 6 (goblins)", "FX 7 (echoes)", "FX 8 (sci-fi)",
+            # Ethnic (104-111)
+            "Sitar", "Banjo", "Shamisen", "Koto", "Kalimba", "Bag pipe", "Fiddle", "Shanai",
+            # Percussive (112-119)
+            "Tinkle Bell", "Agogo", "Steel Drums", "Woodblock", "Taiko Drum", "Melodic Tom",
+            "Synth Drum", "Reverse Cymbal",
+            # Sound Effects (120-127)
+            "Guitar Fret Noise", "Breath Noise", "Seashore", "Bird Tweet", "Telephone Ring",
+            "Helicopter", "Applause", "Gunshot"
+        ]
+        if 0 <= program < len(instruments):
+            return instruments[program]
+        return f"Program {program}"
+
+    def _build_timeline(self, selected_tracks: Optional[List[int]] = None) -> List[MidiNote]:
+        """
+        Build absolute timeline of note events from selected tracks.
+
+        Merges selected tracks into a single sorted timeline, converting
         relative tick times to absolute milliseconds.
+
+        Args:
+            selected_tracks: List of track indices to include (None = all tracks)
 
         Returns:
             List of MidiNote objects sorted by timestamp
@@ -182,6 +300,10 @@ class MidiConverter:
         all_events: List[MidiNote] = []
 
         for track_idx, track in enumerate(self.midi_file.tracks):
+            # Skip tracks not in selection (if selection provided)
+            if selected_tracks is not None and track_idx not in selected_tracks:
+                continue
+
             current_tick = 0
 
             for msg in track:
@@ -207,7 +329,8 @@ class MidiConverter:
     def convert(
         self,
         strategy: VoiceAllocationStrategy = None,
-        freq_transformer: FrequencyTransformer = None
+        freq_transformer: FrequencyTransformer = None,
+        selected_tracks: Optional[List[int]] = None
     ) -> List[MusicEvent]:
         """
         Convert MIDI timeline to MusicEvent sequence.
@@ -215,6 +338,7 @@ class MidiConverter:
         Args:
             strategy: Voice allocation strategy (default: MelodicPriorityStrategy)
             freq_transformer: Frequency transformer (default: OctaveClippingTransformer)
+            selected_tracks: List of track indices to include (None = all tracks)
 
         Returns:
             List of MusicEvent objects with delta timing
@@ -231,12 +355,20 @@ class MidiConverter:
         if freq_transformer is None:
             freq_transformer = OctaveClippingTransformer()
 
+        # Rebuild timeline if specific tracks selected
+        if selected_tracks is not None:
+            timeline = self._build_timeline(selected_tracks)
+            if len(timeline) == 0:
+                raise MidiConversionError(f"Selected tracks {selected_tracks} have no note events")
+        else:
+            timeline = self.timeline
+
         # Reset strategy state
         strategy.reset()
 
         # Group events by timestamp
         events_by_time: Dict[int, Dict[str, List[int]]] = {}
-        for event in self.timeline:
+        for event in timeline:
             if event.timestamp_ms not in events_by_time:
                 events_by_time[event.timestamp_ms] = {'on': [], 'off': []}
 
@@ -289,6 +421,45 @@ class MidiConverter:
                 last_timestamp = timestamp
 
         return output_events
+
+    def get_track_info(self) -> str:
+        """
+        Get formatted track information for user selection.
+
+        Returns:
+            Multi-line string with track details
+        """
+        if not self.track_info:
+            return "No track information available"
+
+        from midi_utils import get_note_name
+
+        lines = ["\nMIDI Tracks:"]
+        lines.append("=" * 80)
+        lines.append(f"{'#':<4} {'Name':<25} {'Instrument':<25} {'Notes':<8} {'Range':<15}")
+        lines.append("-" * 80)
+
+        for track in self.track_info:
+            # Skip tracks with no notes
+            if track['note_count'] == 0:
+                continue
+
+            idx = track['index']
+            name = track['name'][:24]
+            instrument = (track['instrument'] or "Unknown")[:24]
+            note_count = track['note_count']
+
+            if track['note_range'][0] <= track['note_range'][1]:
+                min_note = get_note_name(track['note_range'][0])
+                max_note = get_note_name(track['note_range'][1])
+                note_range = f"{min_note}-{max_note}"
+            else:
+                note_range = "N/A"
+
+            lines.append(f"{idx:<4} {name:<25} {instrument:<25} {note_count:<8} {note_range:<15}")
+
+        lines.append("=" * 80)
+        return "\n".join(lines)
 
     def get_info(self) -> str:
         """
