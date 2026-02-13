@@ -237,11 +237,14 @@ async def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  %(prog)s                                    # Use built-in test sequence
-  %(prog)s --midi song.mid                    # Convert and upload MIDI file
-  %(prog)s --midi song.mid --strategy melodic # Use specific strategy
-  %(prog)s --midi song.mid --transpose none   # No octave clipping
-  %(prog)s --list-strategies                  # Show available options
+  %(prog)s                                          # Use built-in test sequence
+  %(prog)s --midi song.mid                          # Convert and upload MIDI file
+  %(prog)s --midi song.mid --strategy melodic       # Keep extreme pitches (default)
+  %(prog)s --midi song.mid --strategy voice-stealing # Replace oldest notes (LRU)
+  %(prog)s --midi song.mid --strategy rolled        # Arpeggiate >4 notes
+  %(prog)s --midi song.mid --strategy round-robin   # Cycle through motors
+  %(prog)s --midi song.mid --transpose none         # No octave clipping
+  %(prog)s --list-strategies                        # Show all options
         """
     )
     parser.add_argument(
