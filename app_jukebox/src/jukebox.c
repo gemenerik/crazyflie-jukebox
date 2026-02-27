@@ -58,7 +58,9 @@ typedef struct {
 typedef enum {
   PKT_START_UPLOAD,     // Start uploading a new sequence
   PKT_EVENT_DATA,       // Music event data
-  PKT_END_UPLOAD,       // Finish upload and start playback
+  PKT_END_UPLOAD,       // Finish upload (wait for PKT_START_PLAYBACK)
+  PKT_START_PLAYBACK,   // Trigger playback of uploaded sequence
+  PKT_UPLOAD_ACK,       // Sent by drone to confirm upload received
 } PacketType;
 
 // Packet structures for appchannel communication
@@ -206,20 +208,31 @@ void receiveAndPlayMusic()
       }
       else if (pktType == PKT_END_UPLOAD) {
         DEBUG_PRINT("Upload complete: %u events received\n", musicEventCount);
+        // Send ACK back to host
+        uint8_t ack = PKT_UPLOAD_ACK;
+        appchannelSendDataPacket(&ack, sizeof(ack));
         uploadComplete = true;
-
-        // Play the uploaded sequence
-        if (musicEventCount > 0) {
-          playSequence(musicSequence, musicEventCount);
-          DEBUG_PRINT("Playback finished!\n");
-        } else {
-          DEBUG_PRINT("WARNING: No events to play\n");
-        }
       }
       else {
         DEBUG_PRINT("ERROR: Unknown packet type %d\n", pktType);
         break;
       }
+    }
+
+    // Wait for PKT_START_PLAYBACK
+    if (musicEventCount > 0) {
+      DEBUG_PRINT("Waiting for START_PLAYBACK command...\n");
+      while (1) {
+        len = appchannelReceiveDataPacket(buffer, sizeof(buffer), APPCHANNEL_WAIT_FOREVER);
+        if (len > 0 && buffer[0] == PKT_START_PLAYBACK) {
+          DEBUG_PRINT("Starting playback!\n");
+          playSequence(musicSequence, musicEventCount);
+          DEBUG_PRINT("Playback finished!\n");
+          break;
+        }
+      }
+    } else {
+      DEBUG_PRINT("WARNING: No events to play\n");
     }
 
     // Ready for next upload
