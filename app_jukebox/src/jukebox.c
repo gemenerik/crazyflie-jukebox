@@ -110,6 +110,8 @@ void playSequence(const MusicEvent* sequence, size_t length)
     vTaskSuspend(rateSupervisorTaskHandle);
   }
 
+  TickType_t wakeTime = xTaskGetTickCount();
+
   for (size_t i = 0; i < length; i++) {
     const MusicEvent* event = &sequence[i];
 
@@ -118,7 +120,7 @@ void playSequence(const MusicEvent* sequence, size_t length)
       uint32_t remainingMs = event->delta_ms;
       while (remainingMs > 0) {
         uint32_t delayMs = (remainingMs > 50) ? 50 : remainingMs;
-        vTaskDelay(M2T(delayMs));
+        vTaskDelayUntil(&wakeTime, M2T(delayMs));
         remainingMs -= delayMs;
         watchdogReset();  // Feed watchdog every 50ms (timeout is 100-353ms)
       }
