@@ -82,6 +82,20 @@ typedef struct {
 static MusicEvent musicSequence[MAX_MUSIC_EVENTS];
 static size_t musicEventCount = 0;
 
+// Watchdog feeder task
+static TaskHandle_t watchdogFeederHandle = NULL;
+static volatile bool watchdogFeederRunning = false;
+
+void watchdogFeederTask(void* arg)
+{
+  while (watchdogFeederRunning) {
+    watchdogReset();
+    vTaskDelay(M2T(50));
+  }
+  watchdogFeederHandle = NULL;
+  vTaskDelete(NULL);
+}
+
 // Helper to start/stop a motor note immediately (non-blocking)
 void setMotorFrequency(uint8_t motorIndex, uint16_t frequency)
 {
@@ -110,20 +124,25 @@ void playSequence(const MusicEvent* sequence, size_t length)
     vTaskSuspend(rateSupervisorTaskHandle);
   }
 
+  // Start watchdog feeder at lowest priority so it never preempts playback
+  watchdogFeederRunning = true;
+  xTaskCreate(watchdogFeederTask, "wdgFeeder", configMINIMAL_STACK_SIZE, NULL, tskIDLE_PRIORITY + 1, &watchdogFeederHandle);
+
   TickType_t wakeTime = xTaskGetTickCount();
 
   for (size_t i = 0; i < length; i++) {
     const MusicEvent* event = &sequence[i];
 
-    // Wait for delta time, feeding watchdog periodically
+    // Advance absolute target time and sleep until then
     if (event->delta_ms > 0) {
-      uint32_t remainingMs = event->delta_ms;
-      while (remainingMs > 0) {
-        uint32_t delayMs = (remainingMs > 50) ? 50 : remainingMs;
-        vTaskDelayUntil(&wakeTime, M2T(delayMs));
-        remainingMs -= delayMs;
-        watchdogReset();  // Feed watchdog every 50ms (timeout is 100-353ms)
+      // If wakeTime fell behind (due to processing zero-delta events),
+      // resync it to now so the delay is measured from actual wall-clock time
+      // rather than compressing future timing to "catch up"
+      TickType_t now = xTaskGetTickCount();
+      if ((int32_t)(now - wakeTime) > 0) {
+        wakeTime = now;
       }
+      vTaskDelayUntil(&wakeTime, M2T(event->delta_ms));
     }
 
     // Process event
@@ -132,11 +151,12 @@ void playSequence(const MusicEvent* sequence, size_t length)
     } else {
       setMotorFrequency(event->motor, 0);
     }
-
-    watchdogReset();
   }
 
-  // Feed watchdog before resuming tasks
+  // Stop watchdog feeder
+  watchdogFeederRunning = false;
+  // Wait for it to finish (it checks every 50ms)
+  vTaskDelay(M2T(60));
   watchdogReset();
 
   // Resume stabilizer first, then rate supervisor (reverse order of suspension)
