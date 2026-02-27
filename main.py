@@ -6,16 +6,21 @@ This script uploads music sequences to the Crazyflie jukebox app via app channel
 Each motor acts as a speaker by modulating PWM frequency for 4-voice polyphony.
 
 Example usage:
-    python main.py                              # Connect to default URI, upload test sequence
-    python main.py radio://0/80/2M/E7E7E7E701   # Connect to custom URI
+    python main.py --help                             # Show all available arguments
+    python main.py                                    # Connect to default URI, play test sequence
+    python main.py --uri radio://0/80/2M/E7E7E7E701   # Connect to a specific URI
+    python main.py --midi song.mid                    # Convert and upload a MIDI file
+    python main.py --uris URI1 URI2 --midi song.mid   # Connect to multiple drones
 """
 
-import argparse
 import asyncio
 import struct
-from enum import IntEnum
+import sys
 from dataclasses import dataclass
-from typing import List
+from enum import IntEnum
+from typing import List, Optional
+
+import tyro
 
 from cflib2 import Crazyflie, LinkContext
 from midi_utils import (
@@ -288,51 +293,31 @@ def load_sequence_from_midi(midi_path: str, strategy_name: str, transformer_name
     return sequence
 
 
+@dataclass
+class Args:
+    """Upload music to Crazyflie jukebox."""
+
+    uri: Optional[str] = None
+    """Crazyflie URI (default: radio://0/80/2M/E7E7E7E7E7). Mutually exclusive with --uris."""
+
+    uris: Optional[List[str]] = None
+    """Multiple Crazyflie URIs. Mutually exclusive with --uri."""
+
+    midi: Optional[str] = None
+    """Path to MIDI file to convert and upload."""
+
+    strategy: str = "melodic"
+    """Voice allocation strategy."""
+
+    transpose: str = "octave-clip"
+    """Frequency transformation method."""
+
+    list_strategies: bool = False
+    """List available strategies and transformers, then exit."""
+
+
 async def main_async() -> None:
-    parser = argparse.ArgumentParser(
-        description="Upload music to Crazyflie jukebox",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  %(prog)s                                          # Use built-in test sequence
-  %(prog)s --midi song.mid                          # Convert and upload MIDI file
-  %(prog)s --midi song.mid --strategy melodic       # Keep extreme pitches (default)
-  %(prog)s --midi song.mid --strategy voice-stealing # Replace oldest notes (LRU)
-  %(prog)s --midi song.mid --strategy rolled        # Arpeggiate >4 notes
-  %(prog)s --midi song.mid --strategy round-robin   # Cycle through motors
-  %(prog)s --midi song.mid --transpose none         # No octave clipping
-  %(prog)s --list-strategies                        # Show all options
-        """
-    )
-    parser.add_argument(
-        "uri",
-        nargs="?",
-        default="radio://0/80/2M/E7E7E7E7E7",
-        help="Crazyflie URI (default: radio://0/80/2M/E7E7E7E7E7)",
-    )
-    parser.add_argument(
-        "--midi",
-        type=str,
-        help="Path to MIDI file to convert and upload",
-    )
-    parser.add_argument(
-        "--strategy",
-        type=str,
-        default="melodic",
-        help="Voice allocation strategy (default: melodic)",
-    )
-    parser.add_argument(
-        "--transpose",
-        type=str,
-        default="octave-clip",
-        help="Frequency transformation method (default: octave-clip)",
-    )
-    parser.add_argument(
-        "--list-strategies",
-        action="store_true",
-        help="List available strategies and transformers, then exit",
-    )
-    args = parser.parse_args()
+    args = tyro.cli(Args)
 
     # Handle --list-strategies
     if args.list_strategies:
@@ -341,6 +326,13 @@ Examples:
         list_strategies()
         list_transformers()
         return
+
+    # Validate mutual exclusivity of --uri / --uris
+    if args.uri is not None and args.uris is not None:
+        print("Error: --uri and --uris are mutually exclusive.", file=sys.stderr)
+        sys.exit(1)
+
+    uri = args.uri if args.uri is not None else "radio://0/80/2M/E7E7E7E7E7"
 
     # Determine sequence source
     if args.midi:
@@ -353,9 +345,9 @@ Examples:
         sequence = TEST_SEQUENCE
         print(f"\nUsing built-in test sequence ({len(sequence)} events)")
 
-    print(f"\nConnecting to {args.uri}...")
+    print(f"\nConnecting to {uri}...")
     context = LinkContext()
-    cf = await Crazyflie.connect_from_uri(context, args.uri)
+    cf = await Crazyflie.connect_from_uri(context, uri)
     print("Connected!")
 
     # Start console streaming in background

@@ -7,4 +7,5 @@ requires-python = ">=3.13"
 dependencies = [
     "cflib2 @ git+https://github.com/bitcraze/crazyflie-lib-python-v2.git@3436e46306a196740748e7bdbb0fda926899b0c9",
     "mido>=1.3.3",
+    "tyro>=1.0.8",
 ]
