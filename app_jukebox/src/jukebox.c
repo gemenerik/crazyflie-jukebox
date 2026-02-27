@@ -177,7 +177,8 @@ void receiveAndPlayMusic()
     musicEventCount = 0;
 
     // Receive events
-    while (musicEventCount < MAX_MUSIC_EVENTS) {
+    bool uploadComplete = false;
+    while (!uploadComplete) {
       len = appchannelReceiveDataPacket(buffer, sizeof(buffer), APPCHANNEL_WAIT_FOREVER);
 
       if (len == 0) {
@@ -188,16 +189,24 @@ void receiveAndPlayMusic()
       uint8_t pktType = buffer[0];
 
       if (pktType == PKT_EVENT_DATA) {
-        EventDataPacket* eventPkt = (EventDataPacket*)buffer;
-        musicSequence[musicEventCount] = eventPkt->event;
-        musicEventCount++;
+        if (musicEventCount < MAX_MUSIC_EVENTS) {
+          EventDataPacket* eventPkt = (EventDataPacket*)buffer;
+          musicSequence[musicEventCount] = eventPkt->event;
+          musicEventCount++;
 
-        if (musicEventCount % 50 == 0) {
-          DEBUG_PRINT("Received %u events...\n", musicEventCount);
+          if (musicEventCount % 50 == 0) {
+            DEBUG_PRINT("Received %u events...\n", musicEventCount);
+          }
+
+          if (musicEventCount == MAX_MUSIC_EVENTS) {
+            DEBUG_PRINT("WARNING: Event buffer full at %u events, discarding remaining\n", musicEventCount);
+          }
         }
+        // else: buffer full, discard event but keep reading until END_UPLOAD
       }
       else if (pktType == PKT_END_UPLOAD) {
         DEBUG_PRINT("Upload complete: %u events received\n", musicEventCount);
+        uploadComplete = true;
 
         // Play the uploaded sequence
         if (musicEventCount > 0) {
@@ -206,17 +215,11 @@ void receiveAndPlayMusic()
         } else {
           DEBUG_PRINT("WARNING: No events to play\n");
         }
-
-        break;
       }
       else {
         DEBUG_PRINT("ERROR: Unknown packet type %d\n", pktType);
         break;
       }
-    }
-
-    if (musicEventCount >= MAX_MUSIC_EVENTS) {
-      DEBUG_PRINT("WARNING: Event buffer full at %u events\n", musicEventCount);
     }
 
     // Ready for next upload

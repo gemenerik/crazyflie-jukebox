@@ -12,3 +12,6 @@ wheels/
 # Build artifacts
 *.o
 *.o.cmd
+
+# Ignore folder with songs
+songs/

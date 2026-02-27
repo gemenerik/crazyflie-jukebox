@@ -17,7 +17,7 @@ from enum import IntEnum
 from dataclasses import dataclass
 from typing import List
 
-from cflib import Crazyflie, LinkContext
+from cflib2 import Crazyflie, LinkContext
 from midi_utils import (
     MIN_MOTOR_FREQUENCY_HZ,
     MAX_MOTOR_FREQUENCY_HZ,
