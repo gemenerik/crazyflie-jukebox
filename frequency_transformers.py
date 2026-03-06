@@ -161,14 +161,12 @@ def get_transformer(name: str, min_hz: int = MIN_MOTOR_FREQUENCY_HZ, max_hz: int
         available = ', '.join(TRANSFORMERS.keys())
         raise ValueError(f"Unknown transformer '{name}'. Available: {available}")
 
-    transformer_class = TRANSFORMERS[name]
-
-    # Pass min/max Hz to transformers that support it
-    if name in ('octave-clip', 'clamp'):
-        return transformer_class(min_hz=min_hz, max_hz=max_hz)
+    if name == 'octave-clip':
+        return OctaveClippingTransformer(min_hz=min_hz, max_hz=max_hz)
+    elif name == 'clamp':
+        return RangeClampingTransformer(min_hz=min_hz, max_hz=max_hz)
     else:
-        # Passthrough and other transformers don't take parameters
-        return transformer_class()
+        return TRANSFORMERS[name]()
 
 
 def list_transformers() -> None:

@@ -34,6 +34,7 @@
 #include "app_channel.h"
 #include "stabilizer.h"
 #include "watchdog.h"
+#include "usec_time.h"
 
 #define DEBUG_MODULE "JUKEBOX"
 
@@ -58,7 +59,10 @@ typedef struct {
 typedef enum {
   PKT_START_UPLOAD,     // Start uploading a new sequence
   PKT_EVENT_DATA,       // Music event data
-  PKT_END_UPLOAD,       // Finish upload and start playback
+  PKT_END_UPLOAD,       // Finish upload (wait for PKT_START_PLAYBACK)
+  PKT_START_PLAYBACK,   // Trigger playback of uploaded sequence
+  PKT_UPLOAD_ACK,       // Sent by drone to confirm upload received
+  PKT_RESYNC,           // Sync pulse from host to align timing across drones
 } PacketType;
 
 // Packet structures for appchannel communication
@@ -76,9 +80,28 @@ typedef struct {
   uint8_t type;         // PacketType (PKT_END_UPLOAD)
 } __attribute__((packed)) EndUploadPacket;
 
+typedef struct {
+  uint8_t type;        // PKT_RESYNC
+  uint32_t host_us;    // Host microseconds since t0 (with latency compensation)
+} __attribute__((packed)) ResyncPacket;
+
 // Global buffer for uploaded music events
 static MusicEvent musicSequence[MAX_MUSIC_EVENTS];
 static size_t musicEventCount = 0;
+
+// Watchdog feeder task
+static TaskHandle_t watchdogFeederHandle = NULL;
+static volatile bool watchdogFeederRunning = false;
+
+void watchdogFeederTask(void* arg)
+{
+  while (watchdogFeederRunning) {
+    watchdogReset();
+    vTaskDelay(M2T(50));
+  }
+  watchdogFeederHandle = NULL;
+  vTaskDelete(NULL);
+}
 
 // Helper to start/stop a motor note immediately (non-blocking)
 void setMotorFrequency(uint8_t motorIndex, uint16_t frequency)
@@ -96,7 +119,7 @@ void setMotorFrequency(uint8_t motorIndex, uint16_t frequency)
   }
 }
 
-// Play the music sequence
+// Play the music sequence, synchronized to the host via usecTimestamp.
 void playSequence(const MusicEvent* sequence, size_t length)
 {
   // Suspend both stabilizer and rate supervisor tasks to prevent interference
@@ -108,17 +131,39 @@ void playSequence(const MusicEvent* sequence, size_t length)
     vTaskSuspend(rateSupervisorTaskHandle);
   }
 
+  // Start watchdog feeder at lowest priority so it never preempts playback
+  watchdogFeederRunning = true;
+  xTaskCreate(watchdogFeederTask, "wdgFeeder", configMINIMAL_STACK_SIZE, NULL, tskIDLE_PRIORITY + 1, &watchdogFeederHandle);
+
+  // time_offset_us maps local usecTimestamp() to host time:
+  //   host_time_us = usecTimestamp() + time_offset_us
+  // Updated on each resync packet. Initially 0 (host resets drone timer before start).
+  int64_t time_offset_us = 0;
+  int64_t event_target_us = 0;
+
   for (size_t i = 0; i < length; i++) {
     const MusicEvent* event = &sequence[i];
 
-    // Wait for delta time, feeding watchdog periodically
+    // Advance absolute target time and sleep until then
     if (event->delta_ms > 0) {
-      uint32_t remainingMs = event->delta_ms;
-      while (remainingMs > 0) {
-        uint32_t delayMs = (remainingMs > 50) ? 50 : remainingMs;
-        vTaskDelay(M2T(delayMs));
-        remainingMs -= delayMs;
-        watchdogReset();  // Feed watchdog every 50ms (timeout is 100-353ms)
+      event_target_us += (int64_t)event->delta_ms * 1000;
+
+      uint8_t syncBuffer[APPCHANNEL_MTU];
+
+      while (true) {
+        int64_t now_us = time_offset_us + (int64_t)usecTimestamp();
+        if (now_us >= event_target_us) break;
+
+        int64_t remaining_us = event_target_us - now_us;
+        int timeout_ms = (int)(remaining_us / 1000);
+        if (timeout_ms < 1) timeout_ms = 1;
+
+        size_t len = appchannelReceiveDataPacket(syncBuffer, sizeof(syncBuffer), timeout_ms);
+        if (len >= sizeof(ResyncPacket) && syncBuffer[0] == PKT_RESYNC) {
+          ResyncPacket* resync = (ResyncPacket*)syncBuffer;
+          time_offset_us = (int64_t)resync->host_us - (int64_t)usecTimestamp();
+          DEBUG_PRINT("RESYNC: time_offset_us=%lld\n", (long long)time_offset_us);
+        }
       }
     }
 
@@ -128,11 +173,12 @@ void playSequence(const MusicEvent* sequence, size_t length)
     } else {
       setMotorFrequency(event->motor, 0);
     }
-
-    watchdogReset();
   }
 
-  // Feed watchdog before resuming tasks
+  // Stop watchdog feeder
+  watchdogFeederRunning = false;
+  // Wait for it to finish (it checks every 50ms)
+  vTaskDelay(M2T(60));
   watchdogReset();
 
   // Resume stabilizer first, then rate supervisor (reverse order of suspension)
@@ -166,6 +212,9 @@ void receiveAndPlayMusic()
     }
 
     StartUploadPacket* startPkt = (StartUploadPacket*)buffer;
+    if (startPkt->type == PKT_RESYNC) {
+      continue;  // Ignore stale sync pulses from previous playback
+    }
     if (startPkt->type != PKT_START_UPLOAD) {
       DEBUG_PRINT("WARNING: Expected START_UPLOAD, got type %d. Ignoring.\n", startPkt->type);
       continue;
@@ -206,20 +255,31 @@ void receiveAndPlayMusic()
       }
       else if (pktType == PKT_END_UPLOAD) {
         DEBUG_PRINT("Upload complete: %u events received\n", musicEventCount);
+        // Send ACK back to host
+        uint8_t ack = PKT_UPLOAD_ACK;
+        appchannelSendDataPacket(&ack, sizeof(ack));
         uploadComplete = true;
-
-        // Play the uploaded sequence
-        if (musicEventCount > 0) {
-          playSequence(musicSequence, musicEventCount);
-          DEBUG_PRINT("Playback finished!\n");
-        } else {
-          DEBUG_PRINT("WARNING: No events to play\n");
-        }
       }
       else {
         DEBUG_PRINT("ERROR: Unknown packet type %d\n", pktType);
         break;
       }
+    }
+
+    // Wait for PKT_START_PLAYBACK
+    if (musicEventCount > 0) {
+      DEBUG_PRINT("Waiting for START_PLAYBACK command...\n");
+      while (1) {
+        len = appchannelReceiveDataPacket(buffer, sizeof(buffer), APPCHANNEL_WAIT_FOREVER);
+        if (len > 0 && buffer[0] == PKT_START_PLAYBACK) {
+          DEBUG_PRINT("Starting playback!\n");
+          playSequence(musicSequence, musicEventCount);
+          DEBUG_PRINT("Playback finished!\n");
+          break;
+        }
+      }
+    } else {
+      DEBUG_PRINT("WARNING: No events to play\n");
     }
 
     // Ready for next upload
