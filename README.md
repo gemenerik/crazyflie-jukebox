@@ -2,7 +2,7 @@
 
 Play music on your Crazyflie drone by modulating the motor PWM frequencies to generate sound.
 
-Tested on Crazyflie 2.1 (non +). Likely incompatible with Brushless. Propellers must be attached to load the motors properly for accurate pitch.
+Tested on Crazyflie 2.1 and 2.1+. Likely incompatible with Brushless. Propellers must be attached to load the motors properly for accurate pitch.
 
 **Warning:** Use at your own risk. While designed for low thrust, certain note combinations can cause the drone to move, flip, or take off unexpectedly.
 
