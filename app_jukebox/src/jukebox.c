@@ -34,6 +34,7 @@
 #include "app_channel.h"
 #include "stabilizer.h"
 #include "watchdog.h"
+#include "usec_time.h"
 
 #define DEBUG_MODULE "JUKEBOX"
 
@@ -61,6 +62,7 @@ typedef enum {
   PKT_END_UPLOAD,       // Finish upload (wait for PKT_START_PLAYBACK)
   PKT_START_PLAYBACK,   // Trigger playback of uploaded sequence
   PKT_UPLOAD_ACK,       // Sent by drone to confirm upload received
+  PKT_RESYNC,           // Sync pulse from host to align timing across drones
 } PacketType;
 
 // Packet structures for appchannel communication
@@ -77,6 +79,11 @@ typedef struct {
 typedef struct {
   uint8_t type;         // PacketType (PKT_END_UPLOAD)
 } __attribute__((packed)) EndUploadPacket;
+
+typedef struct {
+  uint8_t type;        // PKT_RESYNC
+  uint32_t host_us;    // Host microseconds since t0 (with latency compensation)
+} __attribute__((packed)) ResyncPacket;
 
 // Global buffer for uploaded music events
 static MusicEvent musicSequence[MAX_MUSIC_EVENTS];
@@ -112,7 +119,7 @@ void setMotorFrequency(uint8_t motorIndex, uint16_t frequency)
   }
 }
 
-// Play the music sequence
+// Play the music sequence, synchronized to the host via usecTimestamp.
 void playSequence(const MusicEvent* sequence, size_t length)
 {
   // Suspend both stabilizer and rate supervisor tasks to prevent interference
@@ -128,21 +135,36 @@ void playSequence(const MusicEvent* sequence, size_t length)
   watchdogFeederRunning = true;
   xTaskCreate(watchdogFeederTask, "wdgFeeder", configMINIMAL_STACK_SIZE, NULL, tskIDLE_PRIORITY + 1, &watchdogFeederHandle);
 
-  TickType_t wakeTime = xTaskGetTickCount();
+  // time_offset_us maps local usecTimestamp() to host time:
+  //   host_time_us = usecTimestamp() + time_offset_us
+  // Updated on each resync packet. Initially 0 (host resets drone timer before start).
+  int64_t time_offset_us = 0;
+  int64_t event_target_us = 0;
 
   for (size_t i = 0; i < length; i++) {
     const MusicEvent* event = &sequence[i];
 
     // Advance absolute target time and sleep until then
     if (event->delta_ms > 0) {
-      // If wakeTime fell behind (due to processing zero-delta events),
-      // resync it to now so the delay is measured from actual wall-clock time
-      // rather than compressing future timing to "catch up"
-      TickType_t now = xTaskGetTickCount();
-      if ((int32_t)(now - wakeTime) > 0) {
-        wakeTime = now;
+      event_target_us += (int64_t)event->delta_ms * 1000;
+
+      uint8_t syncBuffer[APPCHANNEL_MTU];
+
+      while (true) {
+        int64_t now_us = time_offset_us + (int64_t)usecTimestamp();
+        if (now_us >= event_target_us) break;
+
+        int64_t remaining_us = event_target_us - now_us;
+        int timeout_ms = (int)(remaining_us / 1000);
+        if (timeout_ms < 1) timeout_ms = 1;
+
+        size_t len = appchannelReceiveDataPacket(syncBuffer, sizeof(syncBuffer), timeout_ms);
+        if (len >= sizeof(ResyncPacket) && syncBuffer[0] == PKT_RESYNC) {
+          ResyncPacket* resync = (ResyncPacket*)syncBuffer;
+          time_offset_us = (int64_t)resync->host_us - (int64_t)usecTimestamp();
+          DEBUG_PRINT("RESYNC: time_offset_us=%lld\n", (long long)time_offset_us);
+        }
       }
-      vTaskDelayUntil(&wakeTime, M2T(event->delta_ms));
     }
 
     // Process event
@@ -190,6 +212,9 @@ void receiveAndPlayMusic()
     }
 
     StartUploadPacket* startPkt = (StartUploadPacket*)buffer;
+    if (startPkt->type == PKT_RESYNC) {
+      continue;  // Ignore stale sync pulses from previous playback
+    }
     if (startPkt->type != PKT_START_UPLOAD) {
       DEBUG_PRINT("WARNING: Expected START_UPLOAD, got type %d. Ignoring.\n", startPkt->type);
       continue;

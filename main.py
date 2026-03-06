@@ -16,6 +16,7 @@ Example usage:
 import asyncio
 import struct
 import sys
+import time
 from dataclasses import dataclass
 from enum import IntEnum
 from typing import List, Optional
@@ -50,6 +51,7 @@ class PacketType(IntEnum):
     PKT_END_UPLOAD = 2
     PKT_START_PLAYBACK = 3
     PKT_UPLOAD_ACK = 4
+    PKT_SYNC = 5
 
 
 @dataclass
@@ -159,6 +161,19 @@ TEST_SEQUENCE = [
     MusicEvent(0, 2, EventType.NOTE_OFF, 0),
     MusicEvent(0, 3, EventType.NOTE_OFF, 0),
 ]
+
+
+async def send_sync_pulses(app_channels: dict, t0: float, interval_s: float = 0.2, latency_ms: int = 20) -> None:
+    """Send periodic sync pulses with host microseconds to all drones during playback."""
+    try:
+        while True:
+            host_us = int((time.monotonic() - t0) * 1e6) + latency_ms * 1000
+            packet = struct.pack('<BI', PacketType.PKT_SYNC, host_us)
+            for app_channel in app_channels.values():
+                app_channel.send(packet)
+            await asyncio.sleep(interval_s)
+    except asyncio.CancelledError:
+        pass
 
 
 async def upload_sequence(app_channel, sequence: List[MusicEvent]) -> None:
@@ -488,6 +503,7 @@ async def main_async() -> None:
     print(f"{len(app_channels)} app channel(s) acquired!")
     print("=" * 60)
 
+    sync_task = None
     try:
         await asyncio.sleep(0.5)
 
@@ -498,11 +514,21 @@ async def main_async() -> None:
             for uri in active_uris
         ])
 
-        # Trigger playback on all drones as fast as possible
-        print("\nStarting playback...")
+        # Reset usec timers on all drones so they share a common time base
+        print("\nResetting usec timers on all drones...")
+        cfs_by_uri = dict(zip(active_uris, cfs))
+        await asyncio.gather(*[cfs_by_uri[uri].param().set("usec.reset", 1) for uri in active_uris])
+        t0 = time.monotonic()
+
+        # Trigger playback on all drones simultaneously
+        print("Starting playback...")
+        packet = struct.pack('<B', PacketType.PKT_START_PLAYBACK)
         for uri in active_uris:
-            await start_playback(app_channels[uri])
+            app_channels[uri].send(packet)
         print("Playback triggered on all drones!")
+
+        # Start sending sync pulses to keep drones aligned
+        sync_task = asyncio.create_task(send_sync_pulses(app_channels, t0))
 
         # Stay connected until user interrupts
         print("\n" + "=" * 60)
@@ -515,6 +541,8 @@ async def main_async() -> None:
     except KeyboardInterrupt:
         print("\n\nInterrupted by user")
     finally:
+        if sync_task is not None:
+            sync_task.cancel()
         for task in console_tasks:
             task.cancel()
         print("Disconnecting...")
