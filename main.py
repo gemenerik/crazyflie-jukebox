@@ -229,13 +229,39 @@ async def stream_console(cf: Crazyflie, label: str = "CF") -> None:
         pass
 
 
-def select_tracks(converter) -> List[int]:
-    """
-    Interactively ask user which tracks to include.
+def parse_track_input(user_input: str, available: List[int]) -> List[int]:
+    """Parse track selection input supporting inclusion, exclusion (!), and 'all'.
 
-    Returns:
-        List of selected track indices (all tracks with notes if user picks all).
+    Returns selected track indices, or raises ValueError on invalid input.
     """
+    if user_input.lower() == 'all':
+        return list(available)
+
+    tokens = user_input.split()
+    has_exclude = any(t.startswith('!') for t in tokens)
+    has_include = any(not t.startswith('!') for t in tokens)
+    if has_exclude and has_include:
+        raise ValueError("Cannot mix inclusions and exclusions. Use e.g., '1 3' or '!2', not both.")
+
+    if has_exclude:
+        excluded = list(dict.fromkeys(int(t[1:]) for t in tokens))
+        invalid = [t for t in excluded if t not in available]
+        if invalid:
+            raise ValueError(f"Invalid or already assigned: {invalid}")
+        picked = [t for t in available if t not in excluded]
+    else:
+        picked = list(dict.fromkeys(int(t) for t in tokens))
+        invalid = [t for t in picked if t not in available]
+        if invalid:
+            raise ValueError(f"Invalid or already assigned: {invalid}")
+
+    if not picked:
+        raise ValueError("No tracks selected.")
+    return picked
+
+
+def select_tracks(converter) -> List[int]:
+    """Interactively ask user which tracks to include."""
     tracks_with_notes = [t['index'] for t in converter.track_info if t['note_count'] > 0]
 
     if len(tracks_with_notes) <= 1:
@@ -247,23 +273,18 @@ def select_tracks(converter) -> List[int]:
     print("or select specific tracks to reduce complexity.")
 
     while True:
-        user_input = input("\nEnter track numbers (e.g., '1 3 5') or press Enter for all tracks: ").strip()
+        user_input = input("\nEnter tracks (e.g., '1 3', '!2' to exclude, or Enter for all): ").strip()
 
         if not user_input:
             print("Using all tracks")
             return tracks_with_notes
 
         try:
-            selected = [int(x.strip()) for x in user_input.split()]
-            invalid = [t for t in selected if t not in tracks_with_notes]
-            if invalid:
-                print(f"Invalid track numbers: {invalid}")
-                print(f"   Valid tracks with notes: {tracks_with_notes}")
-                continue
+            selected = parse_track_input(user_input, tracks_with_notes)
             print(f"Using tracks: {selected}")
             return selected
-        except ValueError:
-            print("Invalid input. Please enter track numbers separated by spaces (e.g., '1 3 5')")
+        except ValueError as e:
+            print(f"{e}")
             continue
 
 
@@ -308,24 +329,19 @@ def assign_tracks_to_drones(selected_tracks: List[int], uris: List[str], track_i
             print(f"  {t}: {track_names.get(t, '?')}")
 
         while True:
-            user_input = input(f"Assign tracks to drone {i+1} (e.g., '1 3'): ").strip()
+            user_input = input(f"Assign tracks to drone {i+1} (e.g., '1 3', '!2' to exclude, or 'all'): ").strip()
             if not user_input:
                 print("Must assign at least one track.")
                 continue
             try:
-                picked = [int(x.strip()) for x in user_input.split()]
-                invalid = [t for t in picked if t not in remaining]
-                if invalid:
-                    print(f"Invalid or already assigned: {invalid}")
-                    continue
+                picked = parse_track_input(user_input, remaining)
                 assignment[uri] = picked
                 for t in picked:
                     remaining.remove(t)
                 print(f"Drone {i+1} assigned tracks: {picked}")
                 break
-            except ValueError:
-                print("Invalid input.")
-                continue
+            except ValueError as e:
+                print(f"{e}")
 
         if not remaining:
             # All tracks assigned, remaining drones get nothing
@@ -419,6 +435,35 @@ async def main_async() -> None:
 
     multi_drone = len(uris) > 1
 
+    # Connect to all drones first (before interactive MIDI setup)
+    print(f"\nConnecting to {len(uris)} Crazyflie(s)...")
+    context = LinkContext()
+    cfs = await asyncio.gather(
+        *[Crazyflie.connect_from_uri(context, uri) for uri in uris]
+    )
+    print("All connected!")
+
+    # Start console streaming for all drones
+    console_tasks = [
+        asyncio.create_task(stream_console(cf, uri))
+        for cf, uri in zip(cfs, uris)
+    ]
+
+    # Get app channels
+    app_channels = {}
+    for uri, cf in zip(uris, cfs):
+        platform = cf.platform()
+        app_channel = await platform.get_app_channel()
+        if app_channel is None:
+            print(f"Error: Could not acquire app channel for {uri}")
+            for task in console_tasks:
+                task.cancel()
+            await asyncio.gather(*[cf.disconnect() for cf in cfs])
+            return
+        app_channels[uri] = app_channel
+
+    print(f"{len(app_channels)} app channel(s) acquired!")
+
     # Determine sequences per drone
     if args.midi:
         from midi_converter import MidiConverter
@@ -458,10 +503,16 @@ async def main_async() -> None:
                 }
         except Exception as e:
             print(f"\nError loading MIDI file: {e}")
+            for task in console_tasks:
+                task.cancel()
+            await asyncio.gather(*[cf.disconnect() for cf in cfs])
             return
     else:
         if multi_drone:
             print("Error: --midi is required when using multiple drones.", file=sys.stderr)
+            for task in console_tasks:
+                task.cancel()
+            await asyncio.gather(*[cf.disconnect() for cf in cfs])
             sys.exit(1)
         drone_sequences = {uris[0]: TEST_SEQUENCE}
         print(f"\nUsing built-in test sequence ({len(TEST_SEQUENCE)} events)")
@@ -471,36 +522,10 @@ async def main_async() -> None:
 
     if not active_uris:
         print("Error: No drones have any events to play.")
+        for task in console_tasks:
+            task.cancel()
+        await asyncio.gather(*[cf.disconnect() for cf in cfs])
         return
-
-    # Connect to all drones
-    print(f"\nConnecting to {len(active_uris)} Crazyflie(s)...")
-    context = LinkContext()
-    cfs = await asyncio.gather(
-        *[Crazyflie.connect_from_uri(context, uri) for uri in active_uris]
-    )
-    print("All connected!")
-
-    # Start console streaming for all drones
-    console_tasks = [
-        asyncio.create_task(stream_console(cf, uri))
-        for cf, uri in zip(cfs, active_uris)
-    ]
-
-    # Get app channels
-    app_channels = {}
-    for uri, cf in zip(active_uris, cfs):
-        platform = cf.platform()
-        app_channel = await platform.get_app_channel()
-        if app_channel is None:
-            print(f"Error: Could not acquire app channel for {uri}")
-            for task in console_tasks:
-                task.cancel()
-            await asyncio.gather(*[cf.disconnect() for cf in cfs])
-            return
-        app_channels[uri] = app_channel
-
-    print(f"{len(app_channels)} app channel(s) acquired!")
     print("=" * 60)
 
     sync_task = None
@@ -516,7 +541,7 @@ async def main_async() -> None:
 
         # Reset usec timers on all drones so they share a common time base
         print("\nResetting usec timers on all drones...")
-        cfs_by_uri = dict(zip(active_uris, cfs))
+        cfs_by_uri = dict(zip(uris, cfs))
         await asyncio.gather(*[cfs_by_uri[uri].param().set("usec.reset", 1) for uri in active_uris])
         t0 = time.monotonic()
 
