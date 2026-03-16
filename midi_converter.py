@@ -30,6 +30,7 @@ class MidiNote:
     timestamp_ms: int    # Absolute time in milliseconds
     note: int            # MIDI note number (0-127)
     is_note_on: bool     # True for note_on, False for note_off
+    channel: int = 0     # MIDI channel (0-15)
 
 
 class MidiConverter:
@@ -52,6 +53,7 @@ class MidiConverter:
         self.ticks_per_beat: int = 0
         self.timeline: List[MidiNote] = []
         self.track_info: List[Dict] = []  # Track metadata for user selection
+        self._type0_split: bool = False  # True when Type 0 file is split by channel
 
     def load_midi(self, filename: str) -> None:
         """
@@ -173,9 +175,22 @@ class MidiConverter:
 
         return int(round(current_time_ms))
 
+    def _is_type0_multichannel(self) -> bool:
+        """Check if this is a Type 0 MIDI file with multiple note channels."""
+        if self.midi_file.type != 0 or len(self.midi_file.tracks) != 1:
+            return False
+        channels = set()
+        for msg in self.midi_file.tracks[0]:
+            if msg.type in ('note_on', 'note_off') and hasattr(msg, 'channel'):
+                channels.add(msg.channel)
+        return len(channels) > 1
+
     def _analyze_tracks(self) -> List[Dict]:
         """
         Analyze each track to help users select which ones to use.
+
+        For Type 0 MIDI files with multiple channels, creates virtual tracks
+        per channel so users can select individual instruments.
 
         Returns:
             List of dicts with track metadata: {
@@ -187,6 +202,10 @@ class MidiConverter:
                 'channels': set
             }
         """
+        # For Type 0 files with multiple channels, split by channel
+        if self._is_type0_multichannel():
+            return self._analyze_channels_as_tracks()
+
         track_info = []
 
         for track_idx, track in enumerate(self.midi_file.tracks):
@@ -223,6 +242,63 @@ class MidiConverter:
             if notes:
                 info['note_range'] = (min(notes), max(notes))
 
+            track_info.append(info)
+
+        return track_info
+
+    def _analyze_channels_as_tracks(self) -> List[Dict]:
+        """
+        Analyze a Type 0 MIDI file by splitting channels into virtual tracks.
+
+        Returns:
+            List of dicts with per-channel track metadata, using channel number as index.
+        """
+        if self.midi_file is None:
+            return []
+        track = self.midi_file.tracks[0]
+
+        # Collect per-channel info
+        channel_data: Dict[int, Dict] = {}
+        track_name = None
+        programs: Dict[int, int] = {}  # channel -> program number
+
+        for msg in track:
+            if msg.type == 'track_name':
+                track_name = msg.name
+            if msg.type == 'program_change':
+                programs[msg.channel] = msg.program
+            if msg.type in ('note_on', 'note_off') and hasattr(msg, 'channel'):
+                ch = msg.channel
+                if ch not in channel_data:
+                    channel_data[ch] = {'notes': [], 'note_count': 0}
+                if msg.type == 'note_on' and msg.velocity > 0:
+                    channel_data[ch]['note_count'] += 1
+                    channel_data[ch]['notes'].append(msg.note)
+
+        self._type0_split = True  # Flag so _build_timeline knows to filter by channel
+
+        track_info = []
+        for ch in sorted(channel_data.keys()):
+            data = channel_data[ch]
+            instrument = self._get_instrument_name(programs[ch]) if ch in programs else None
+            # Channel 9 is always percussion in GM
+            if ch == 9:
+                name = "Percussion"
+                if instrument is None:
+                    instrument = "Percussion"
+            else:
+                name = f"Ch {ch}"
+                if track_name and len(channel_data) > 1:
+                    name = f"Ch {ch}"
+
+            info = {
+                'index': ch,  # Use channel number as index for virtual tracks
+                'name': name,
+                'instrument': instrument,
+                'note_count': data['note_count'],
+                'note_range': (min(data['notes']), max(data['notes'])) if data['notes'] else (127, 0),
+                'channels': {ch}
+            }
             track_info.append(info)
 
         return track_info
@@ -291,17 +367,22 @@ class MidiConverter:
         Merges selected tracks into a single sorted timeline, converting
         relative tick times to absolute milliseconds.
 
+        For Type 0 multichannel files, selected_tracks refers to channel numbers
+        instead of track indices.
+
         Args:
-            selected_tracks: List of track indices to include (None = all tracks)
+            selected_tracks: List of track indices (or channel numbers for Type 0)
+                             to include (None = all)
 
         Returns:
             List of MidiNote objects sorted by timestamp
         """
         all_events: List[MidiNote] = []
+        filter_by_channel = getattr(self, '_type0_split', False)
 
         for track_idx, track in enumerate(self.midi_file.tracks):
-            # Skip tracks not in selection (if selection provided)
-            if selected_tracks is not None and track_idx not in selected_tracks:
+            # For normal multi-track files, skip unselected tracks
+            if not filter_by_channel and selected_tracks is not None and track_idx not in selected_tracks:
                 continue
 
             current_tick = 0
@@ -311,15 +392,22 @@ class MidiConverter:
 
                 # Handle note_on messages
                 if msg.type == 'note_on':
+                    channel = msg.channel if hasattr(msg, 'channel') else 0
+                    # For Type 0 files, filter by channel
+                    if filter_by_channel and selected_tracks is not None and channel not in selected_tracks:
+                        continue
                     timestamp_ms = self._ticks_to_ms(current_tick)
                     # MIDI spec: note_on with velocity=0 is equivalent to note_off
                     is_on = msg.velocity > 0
-                    all_events.append(MidiNote(timestamp_ms, msg.note, is_on))
+                    all_events.append(MidiNote(timestamp_ms, msg.note, is_on, channel))
 
                 # Handle note_off messages
                 elif msg.type == 'note_off':
+                    channel = msg.channel if hasattr(msg, 'channel') else 0
+                    if filter_by_channel and selected_tracks is not None and channel not in selected_tracks:
+                        continue
                     timestamp_ms = self._ticks_to_ms(current_tick)
-                    all_events.append(MidiNote(timestamp_ms, msg.note, False))
+                    all_events.append(MidiNote(timestamp_ms, msg.note, False, channel))
 
         # Sort by timestamp (stable sort preserves order of simultaneous events)
         all_events.sort(key=lambda e: e.timestamp_ms)
@@ -492,8 +580,12 @@ class MidiConverter:
         else:
             note_range = "N/A"
 
+        track_line = f"  Tracks: {len(self.midi_file.tracks)}"
+        if self._type0_split:
+            track_line += f" (Type 0 — split into {len(self.track_info)} channels)"
+
         info = f"""MIDI File Information:
-  Tracks: {len(self.midi_file.tracks)}
+{track_line}
   Ticks per beat: {self.ticks_per_beat}
   Duration: {duration_sec:.1f} seconds
   Total events: {len(self.timeline)} ({note_on_count} note-on, {note_off_count} note-off)
