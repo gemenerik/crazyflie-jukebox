@@ -2,7 +2,7 @@
 
 Play music on your Crazyflie drone by modulating the motor PWM frequencies to generate sound.
 
-Tested on Crazyflie 2.1 (non +). Likely incompatible with Brushless. Propellers must be attached to load the motors properly for accurate pitch.
+Tested on Crazyflie 2.1 and 2.1+. Likely incompatible with Brushless. Propellers must be attached to load the motors properly for accurate pitch.
 
 **Warning:** Use at your own risk. While designed for low thrust, certain note combinations can cause the drone to move, flip, or take off unexpectedly.
 
@@ -32,9 +32,19 @@ Run with default test sequence:
 python main.py
 ```
 
-Connect to specific Crazyflie:
+Connect to a specific Crazyflie:
 ```bash
 python main.py --uri radio://0/80/2M/E7E7E7E701 --midi song.mid
 ```
+
+### Multi-drone swarm playback
+
+Play a MIDI file across multiple drones, with each drone playing different tracks:
+
+```bash
+python main.py --uris radio://0/80/2M/E7E7E7E701 radio://0/80/2M/E7E7E7E702 --midi song.mid
+```
+
+The tool will prompt you to select which MIDI tracks to use and how to assign them across drones. Playback is synchronized: all drones receive periodic sync pulses from the host to stay aligned.
 
 Press Ctrl+C to disconnect and terminate. Terminating the program will not stop music playback.

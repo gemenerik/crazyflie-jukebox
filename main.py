@@ -16,6 +16,7 @@ Example usage:
 import asyncio
 import struct
 import sys
+import time
 from dataclasses import dataclass
 from enum import IntEnum
 from typing import List, Optional
@@ -48,6 +49,9 @@ class PacketType(IntEnum):
     PKT_START_UPLOAD = 0
     PKT_EVENT_DATA = 1
     PKT_END_UPLOAD = 2
+    PKT_START_PLAYBACK = 3
+    PKT_UPLOAD_ACK = 4
+    PKT_SYNC = 5
 
 
 @dataclass
@@ -159,6 +163,19 @@ TEST_SEQUENCE = [
 ]
 
 
+async def send_sync_pulses(app_channels: dict, t0: float, interval_s: float = 0.2, latency_ms: int = 20) -> None:
+    """Send periodic sync pulses with host microseconds to all drones during playback."""
+    try:
+        while True:
+            host_us = int((time.monotonic() - t0) * 1e6) + latency_ms * 1000
+            packet = struct.pack('<BI', PacketType.PKT_SYNC, host_us)
+            for app_channel in app_channels.values():
+                app_channel.send(packet)
+            await asyncio.sleep(interval_s)
+    except asyncio.CancelledError:
+        pass
+
+
 async def upload_sequence(app_channel, sequence: List[MusicEvent]) -> None:
     """Upload a music sequence to the Crazyflie"""
     print(f"\nUploading {len(sequence)} events...")
@@ -180,115 +197,187 @@ async def upload_sequence(app_channel, sequence: List[MusicEvent]) -> None:
     # Send END_UPLOAD packet
     end_packet = struct.pack('<B', PacketType.PKT_END_UPLOAD)
     app_channel.send(end_packet)
-    print(f"Sent END_UPLOAD")
-    print("Upload complete! Music should be playing on the Crazyflie.")
+
+    # Wait for drone to confirm it received all events
+    while True:
+        packets = await app_channel.receive()
+        for pkt in packets:
+            if len(pkt) > 0 and pkt[0] == PacketType.PKT_UPLOAD_ACK:
+                print(f"Upload confirmed by drone.")
+                return
 
 
-async def stream_console(cf: Crazyflie) -> None:
+
+async def stream_console(cf: Crazyflie, label: str = "CF") -> None:
     """Background task to stream console output"""
     console = cf.console()
-    print("\n--- Crazyflie Console ---")
+    print(f"\n--- {label} Console ---")
 
     try:
         while True:
             lines = await console.get_lines()
             for line in lines:
-                print(f"[CF] {line}")
+                print(f"[{label}] {line}")
             await asyncio.sleep(0.1)
     except asyncio.CancelledError:
         pass
 
 
-def load_sequence_from_midi(midi_path: str, strategy_name: str, transformer_name: str) -> List[MusicEvent]:
+def parse_track_input(user_input: str, available: List[int]) -> List[int]:
+    """Parse track selection input supporting inclusion, exclusion (!), and 'all'.
+
+    Returns selected track indices, or raises ValueError on invalid input.
     """
-    Load and convert MIDI file to MusicEvent sequence.
+    if user_input.lower() == 'all':
+        return list(available)
+
+    tokens = user_input.split()
+    has_exclude = any(t.startswith('!') for t in tokens)
+    has_include = any(not t.startswith('!') for t in tokens)
+    if has_exclude and has_include:
+        raise ValueError("Cannot mix inclusions and exclusions. Use e.g., '1 3' or '!2', not both.")
+
+    if has_exclude:
+        excluded = list(dict.fromkeys(int(t[1:]) for t in tokens))
+        invalid = [t for t in excluded if t not in available]
+        if invalid:
+            raise ValueError(f"Invalid or already assigned: {invalid}")
+        picked = [t for t in available if t not in excluded]
+    else:
+        picked = list(dict.fromkeys(int(t) for t in tokens))
+        invalid = [t for t in picked if t not in available]
+        if invalid:
+            raise ValueError(f"Invalid or already assigned: {invalid}")
+
+    if not picked:
+        raise ValueError("No tracks selected.")
+    return picked
+
+
+def select_tracks(converter) -> List[int]:
+    """Interactively ask user which tracks to include."""
+    tracks_with_notes = [t['index'] for t in converter.track_info if t['note_count'] > 0]
+
+    if len(tracks_with_notes) <= 1:
+        print(f"\nOnly one track with notes found, using it automatically.")
+        return tracks_with_notes
+
+    print(f"\nThis MIDI file has {len(tracks_with_notes)} tracks with notes.")
+    print("You can use all tracks (they'll be mixed together),")
+    print("or select specific tracks to reduce complexity.")
+
+    while True:
+        user_input = input("\nEnter tracks (e.g., '1 3', '!2' to exclude, or Enter for all): ").strip()
+
+        if not user_input:
+            print("Using all tracks")
+            return tracks_with_notes
+
+        try:
+            selected = parse_track_input(user_input, tracks_with_notes)
+            print(f"Using tracks: {selected}")
+            return selected
+        except ValueError as e:
+            print(f"{e}")
+            continue
+
+
+def assign_tracks_to_drones(selected_tracks: List[int], uris: List[str], track_info: List[dict]) -> dict:
+    """
+    Interactively assign tracks to drones.
+
+    For each drone (except the last), prompt user to pick tracks from the remaining pool.
+    The last drone auto-gets all remaining tracks.
 
     Args:
-        midi_path: Path to MIDI file
+        selected_tracks: List of track indices to distribute
+        uris: List of drone URIs
+        track_info: Track metadata for display
+
+    Returns:
+        Dict mapping URI to list of track indices
+    """
+    track_names = {}
+    for t in track_info:
+        name = t['name']
+        if t['instrument']:
+            name += f" ({t['instrument']})"
+        track_names[t['index']] = name
+
+    remaining = list(selected_tracks)
+    assignment = {}
+
+    for i, uri in enumerate(uris):
+        is_last = (i == len(uris) - 1)
+
+        if is_last:
+            # Last drone gets all remaining tracks
+            assignment[uri] = remaining
+            print(f"\nDrone {i+1} ({uri}) auto-assigned remaining tracks: {remaining}")
+            for t in remaining:
+                print(f"  Track {t}: {track_names.get(t, '?')}")
+            break
+
+        print(f"\nDrone {i+1} ({uri}) — available tracks:")
+        for t in remaining:
+            print(f"  {t}: {track_names.get(t, '?')}")
+
+        while True:
+            user_input = input(f"Assign tracks to drone {i+1} (e.g., '1 3', '!2' to exclude, or 'all'): ").strip()
+            if not user_input:
+                print("Must assign at least one track.")
+                continue
+            try:
+                picked = parse_track_input(user_input, remaining)
+                assignment[uri] = picked
+                for t in picked:
+                    remaining.remove(t)
+                print(f"Drone {i+1} assigned tracks: {picked}")
+                break
+            except ValueError as e:
+                print(f"{e}")
+
+        if not remaining:
+            # All tracks assigned, remaining drones get nothing
+            for j in range(i + 1, len(uris)):
+                assignment[uris[j]] = []
+                print(f"\nDrone {j+1} ({uris[j]}) — no remaining tracks to assign.")
+            break
+
+    return assignment
+
+
+def convert_tracks_to_sequence(
+    converter, tracks: List[int], strategy_name: str, transformer_name: str
+) -> List[MusicEvent]:
+    """
+    Convert specific tracks from a loaded MIDI file to a MusicEvent sequence.
+
+    Args:
+        converter: MidiConverter with loaded MIDI file
+        tracks: Track indices to include
         strategy_name: Voice allocation strategy name
         transformer_name: Frequency transformer name
 
     Returns:
-        List of MusicEvent objects
+        List of MusicEvent objects (truncated to MAX_MUSIC_EVENTS if needed)
     """
-    from midi_converter import MidiConverter
     from voice_strategies import get_strategy
     from frequency_transformers import get_transformer
 
-    print(f"\nLoading MIDI file: {midi_path}")
-    converter = MidiConverter()
-    converter.load_midi(midi_path)
-
-    # Print MIDI info
-    print(converter.get_info())
-
-    # Show track information and ask user which tracks to use
-    print(converter.get_track_info())
-
-    selected_tracks = None
-    tracks_with_notes = [t['index'] for t in converter.track_info if t['note_count'] > 0]
-
-    if len(tracks_with_notes) > 1:
-        print(f"\nThis MIDI file has {len(tracks_with_notes)} tracks with notes.")
-        print("You can use all tracks (they'll be mixed together),")
-        print("or select specific tracks to reduce complexity.")
-
-        while True:
-            user_input = input("\nEnter track numbers (e.g., '1 3 5') or press Enter for all tracks: ").strip()
-
-            if not user_input:
-                # User pressed Enter - use all tracks
-                print("Using all tracks")
-                selected_tracks = None
-                break
-
-            try:
-                # Parse space-separated track numbers
-                selected_tracks = [int(x.strip()) for x in user_input.split()]
-
-                # Validate track numbers
-                invalid_tracks = [t for t in selected_tracks if t not in tracks_with_notes]
-                if invalid_tracks:
-                    print(f"❌ Invalid track numbers: {invalid_tracks}")
-                    print(f"   Valid tracks with notes: {tracks_with_notes}")
-                    continue
-
-                print(f"Using tracks: {selected_tracks}")
-                break
-
-            except ValueError:
-                print("❌ Invalid input. Please enter track numbers separated by spaces (e.g., '1 3 5')")
-                continue
-    else:
-        print(f"\nOnly one track with notes found, using it automatically.")
-        selected_tracks = None
-
-    print(f"\nConverting with:")
     strategy = get_strategy(strategy_name)
-    print(f"  Voice allocation: {strategy.get_description()}")
-
-    # Get transformer with motor frequency range limits
     transformer = get_transformer(transformer_name, min_hz=MIN_MOTOR_FREQUENCY_HZ, max_hz=MAX_MOTOR_FREQUENCY_HZ)
 
-    print(f"  Frequency transform: {transformer.get_description()}")
+    sequence = converter.convert(strategy, transformer, tracks if tracks else None)
+    print(f"  Generated {len(sequence)} events")
 
-    sequence = converter.convert(strategy, transformer, selected_tracks)
-    print(f"\nGenerated {len(sequence)} MusicEvent objects")
-
-    # Check if sequence exceeds firmware buffer limit
     if len(sequence) > MAX_MUSIC_EVENTS:
-        print(f"\n⚠️  WARNING: Sequence has {len(sequence)} events, but firmware buffer limit is {MAX_MUSIC_EVENTS}")
-        print(f"    Truncating to first {MAX_MUSIC_EVENTS} events...")
-
-        # Calculate approximate duration being truncated
-        if sequence:
-            total_duration_ms = sum(event.delta_ms for event in sequence)
-            truncated_duration_ms = sum(event.delta_ms for event in sequence[:MAX_MUSIC_EVENTS])
-            kept_percentage = (truncated_duration_ms / total_duration_ms * 100) if total_duration_ms > 0 else 0
-            print(f"    Keeping approximately {kept_percentage:.1f}% of the song ({truncated_duration_ms/1000:.1f}s / {total_duration_ms/1000:.1f}s)")
-
+        print(f"  WARNING: Truncating {len(sequence)} events to {MAX_MUSIC_EVENTS}")
+        total_duration_ms = sum(event.delta_ms for event in sequence)
+        truncated_duration_ms = sum(event.delta_ms for event in sequence[:MAX_MUSIC_EVENTS])
+        kept_percentage = (truncated_duration_ms / total_duration_ms * 100) if total_duration_ms > 0 else 0
+        print(f"  Keeping ~{kept_percentage:.1f}% ({truncated_duration_ms/1000:.1f}s / {total_duration_ms/1000:.1f}s)")
         sequence = sequence[:MAX_MUSIC_EVENTS]
-        print(f"    Final sequence: {len(sequence)} events\n")
 
     return sequence
 
@@ -332,61 +421,151 @@ async def main_async() -> None:
         print("Error: --uri and --uris are mutually exclusive.", file=sys.stderr)
         sys.exit(1)
 
-    uri = args.uri if args.uri is not None else "radio://0/80/2M/E7E7E7E7E7"
+    # Build list of URIs
+    if args.uris is not None:
+        uris = args.uris
+    else:
+        uris = [args.uri if args.uri is not None else "radio://0/80/2M/E7E7E7E7E7"]
 
-    # Determine sequence source
+    multi_drone = len(uris) > 1
+
+    # Connect to all drones first (before interactive MIDI setup)
+    print(f"\nConnecting to {len(uris)} Crazyflie(s)...")
+    context = LinkContext()
+    cfs = await asyncio.gather(
+        *[Crazyflie.connect_from_uri(context, uri) for uri in uris]
+    )
+    print("All connected!")
+
+    # Start console streaming for all drones
+    console_tasks = [
+        asyncio.create_task(stream_console(cf, uri))
+        for cf, uri in zip(cfs, uris)
+    ]
+
+    # Get app channels
+    app_channels = {}
+    for uri, cf in zip(uris, cfs):
+        platform = cf.platform()
+        app_channel = await platform.get_app_channel()
+        if app_channel is None:
+            print(f"Error: Could not acquire app channel for {uri}")
+            for task in console_tasks:
+                task.cancel()
+            await asyncio.gather(*[cf.disconnect() for cf in cfs])
+            return
+        app_channels[uri] = app_channel
+
+    print(f"{len(app_channels)} app channel(s) acquired!")
+
+    # Determine sequences per drone
     if args.midi:
+        from midi_converter import MidiConverter
+
         try:
-            sequence = load_sequence_from_midi(args.midi, args.strategy, args.transpose)
+            print(f"\nLoading MIDI file: {args.midi}")
+            converter = MidiConverter()
+            converter.load_midi(args.midi)
+            print(converter.get_info())
+            print(converter.get_track_info())
+
+            selected_tracks = select_tracks(converter)
+
+            if multi_drone:
+                # Assign tracks to drones interactively
+                track_assignment = assign_tracks_to_drones(
+                    selected_tracks, uris, converter.track_info
+                )
+                # Convert per drone
+                drone_sequences = {}
+                print(f"\nConverting with strategy={args.strategy}, transpose={args.transpose}:")
+                for uri, tracks in track_assignment.items():
+                    if not tracks:
+                        print(f"\n  {uri}: no tracks, skipping")
+                        continue
+                    print(f"\n  {uri} (tracks {tracks}):")
+                    drone_sequences[uri] = convert_tracks_to_sequence(
+                        converter, tracks, args.strategy, args.transpose
+                    )
+            else:
+                # Single drone gets all selected tracks
+                print(f"\nConverting with strategy={args.strategy}, transpose={args.transpose}:")
+                drone_sequences = {
+                    uris[0]: convert_tracks_to_sequence(
+                        converter, selected_tracks, args.strategy, args.transpose
+                    )
+                }
         except Exception as e:
             print(f"\nError loading MIDI file: {e}")
+            for task in console_tasks:
+                task.cancel()
+            await asyncio.gather(*[cf.disconnect() for cf in cfs])
             return
     else:
-        sequence = TEST_SEQUENCE
-        print(f"\nUsing built-in test sequence ({len(sequence)} events)")
+        if multi_drone:
+            print("Error: --midi is required when using multiple drones.", file=sys.stderr)
+            for task in console_tasks:
+                task.cancel()
+            await asyncio.gather(*[cf.disconnect() for cf in cfs])
+            sys.exit(1)
+        drone_sequences = {uris[0]: TEST_SEQUENCE}
+        print(f"\nUsing built-in test sequence ({len(TEST_SEQUENCE)} events)")
 
-    print(f"\nConnecting to {uri}...")
-    context = LinkContext()
-    cf = await Crazyflie.connect_from_uri(context, uri)
-    print("Connected!")
+    # Filter out drones with no sequence
+    active_uris = [uri for uri in uris if drone_sequences.get(uri)]
 
-    # Start console streaming in background
-    console_task = asyncio.create_task(stream_console(cf))
-
-    platform = cf.platform()
-    app_channel = await platform.get_app_channel()
-
-    if app_channel is None:
-        print("Error: Could not acquire app channel (already in use?)")
-        console_task.cancel()
-        await cf.disconnect()
+    if not active_uris:
+        print("Error: No drones have any events to play.")
+        for task in console_tasks:
+            task.cancel()
+        await asyncio.gather(*[cf.disconnect() for cf in cfs])
         return
-
-    print("App channel acquired!")
     print("=" * 60)
 
+    sync_task = None
     try:
-        # Wait a moment for console to show startup messages
         await asyncio.sleep(0.5)
 
-        # Upload and play the sequence
-        await upload_sequence(app_channel, sequence)
+        # Upload to all drones in parallel
+        print("\nUploading sequences...")
+        await asyncio.gather(*[
+            upload_sequence(app_channels[uri], drone_sequences[uri])
+            for uri in active_uris
+        ])
+
+        # Reset usec timers on all drones so they share a common time base
+        print("\nResetting usec timers on all drones...")
+        cfs_by_uri = dict(zip(uris, cfs))
+        await asyncio.gather(*[cfs_by_uri[uri].param().set("usec.reset", 1) for uri in active_uris])
+        t0 = time.monotonic()
+
+        # Trigger playback on all drones simultaneously
+        print("Starting playback...")
+        packet = struct.pack('<B', PacketType.PKT_START_PLAYBACK)
+        for uri in active_uris:
+            app_channels[uri].send(packet)
+        print("Playback triggered on all drones!")
+
+        # Start sending sync pulses to keep drones aligned
+        sync_task = asyncio.create_task(send_sync_pulses(app_channels, t0))
 
         # Stay connected until user interrupts
         print("\n" + "=" * 60)
         print("Connected! Press Ctrl+C to disconnect.")
         print("=" * 60)
 
-        # Wait indefinitely until Ctrl+C
         while True:
             await asyncio.sleep(1)
 
     except KeyboardInterrupt:
         print("\n\nInterrupted by user")
     finally:
-        console_task.cancel()
+        if sync_task is not None:
+            sync_task.cancel()
+        for task in console_tasks:
+            task.cancel()
         print("Disconnecting...")
-        await cf.disconnect()
+        await asyncio.gather(*[cf.disconnect() for cf in cfs])
         print("Disconnected!")
 
 
