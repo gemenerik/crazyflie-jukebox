@@ -208,12 +208,6 @@ async def upload_sequence(app_channel, sequence: List[MusicEvent]) -> None:
 
 
 
-async def start_playback(app_channel) -> None:
-    """Send the start playback command to trigger the uploaded sequence."""
-    packet = struct.pack('<B', PacketType.PKT_START_PLAYBACK)
-    app_channel.send(packet)
-
-
 async def stream_console(cf: Crazyflie, label: str = "CF") -> None:
     """Background task to stream console output"""
     console = cf.console()
